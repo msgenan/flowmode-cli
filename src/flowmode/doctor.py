@@ -29,7 +29,15 @@ from flowmode import shared
 from flowmode.agents.claude import HOOK_PREFIX
 from flowmode.agents.codex import codex_home
 from flowmode.github_cli import gh_ready
-from flowmode.member_config import MemberConfig, load_member_config, old_token_hint
+from flowmode.member_config import (
+    MemberConfig,
+    load_member_config,
+    old_token_hint,
+    read_config_file,
+    set_workspace_repo,
+    workspace_entries,
+    workspace_refusal,
+)
 from flowmode.refs import display_safe
 from flowmode.repo import find_repo, is_checkout
 
@@ -157,6 +165,8 @@ def _why(exc: Exception, cfg: MemberConfig) -> str:
     if isinstance(exc, ApiError):
         if exc.status == 401:
             return f"token rejected by {cfg.server_url}"
+        if refusal := workspace_refusal(exc.status, exc.detail):  # S19: never names the other workspace
+            return refusal
         detail = exc.detail if exc.status != 422 else "the server refused the report's fields"
         return f"{detail} ({exc.status})"
     return type(exc).__name__
@@ -193,6 +203,17 @@ def _outcome(answer: dict) -> tuple[str, str | None, bool, bool]:
     team = answer.get("team_repo")
     team = shared.public_repo(team) if isinstance(team, str) else None
     return display_safe(str(state)), team, answer.get("leader") is True, answer.get("team_repo_changed") is True
+
+
+def _remember_team_repo(cfg: MemberConfig | None, team: str | None) -> None:
+    """S19 §4.4: the team repo a report's answer names becomes the chosen entry's `repo` in config.toml (e.g. right
+    after `doctor --team-repo`), so this clone keeps choosing that workspace by its origin. Best effort."""
+    if team is None or cfg is None or cfg.workspace is None:
+        return
+    try:
+        set_workspace_repo(cfg.workspace, team)
+    except OSError as exc:
+        print(f"note: config.toml not updated with the team repo ({exc.strerror or exc})", file=sys.stderr)
 
 
 def _team_line(team: str | None) -> str:
@@ -233,6 +254,7 @@ def send_after_install(repo: Path, cfg: MemberConfig) -> None:
         print(f"note: repo report not sent ({why}); run flowmode doctor in the clone later", file=sys.stderr)
         return
     state, team, _leader, changed = _outcome(answer)
+    _remember_team_repo(cfg, team)
     print(f"repo report sent: card 3 {state} (flowmode doctor shows each fact)")
     if changed:
         print(_team_line(team))
@@ -295,6 +317,44 @@ def _lines(facts: dict, fixes: list[dict], team: str | None, sent: bool, answer:
     return lines
 
 
+def _card_state(cfg: MemberConfig, token: str) -> str:
+    """S19 §4.4: one entry's token checked with card 3's state (`GET /api/me/cards`, best effort); never the token."""
+    from flowmode.api_client import ApiClient
+
+    if old := old_token_hint(cfg.server_url, token):
+        return old
+    client = None
+    try:
+        client = ApiClient(cfg.server_url, token, timeout=cfg.request_timeout_seconds)
+        cards = client.my_cards(best_effort=True).get("cards")
+        card = next((c for c in cards if isinstance(c, dict) and c.get("card") == shared.REPO_CARD), {})
+    except Exception as exc:  # noqa: BLE001 — one entry's line, never a traceback
+        return f"not checked: {display_safe(_why(exc, cfg))}"
+    finally:
+        if client is not None:
+            client.close()
+    return f"token valid · card 3 {display_safe(str(card.get('state')))}"
+
+
+def _workspace_lines(cfg: MemberConfig | None, state: str | None, why: str | None) -> list[str]:
+    """S19 §4.4: each `[workspaces.<id>]` entry of config.toml — name, id, repo, whether its token is valid and its card
+    3 state; `→` marks the one this run used (its state is this report's). Never a token. [] for a v0.18 file."""
+    entries = workspace_entries(read_config_file())
+    if cfg is None or not entries:
+        return []
+    lines = ["workspaces on this computer:"]
+    for wid, entry in entries.items():
+        mine = wid == cfg.workspace
+        if mine:
+            checked = f"token valid · card 3 {state}" if state is not None else f"report not sent: {why}"
+        else:
+            checked = _card_state(cfg, entry["token"])
+        repo = display_safe(entry["repo"]) if entry["repo"] else "no team repo yet"
+        name = display_safe(entry["name"]) or "(no name)"
+        lines.append(f"{'→' if mine else ' '} {name} ({display_safe(wid)}) · {repo} · {checked}")
+    return lines
+
+
 def doctor_cmd(args) -> int:
     cfg = load_member_config()
     info = find_repo(Path.cwd())
@@ -308,6 +368,7 @@ def doctor_cmd(args) -> int:
     answer, why = send(cfg, {**facts, "set_team_repo": True} if args.team_repo else facts)
     sent = answer is not None
     state, team, leader, changed = _outcome(answer) if sent else ("", None, False, False)
+    _remember_team_repo(cfg, team)
     fixes = shared.repo_fixes(facts, team, leader, team_known=sent)
     if args.json:
         if sent:
@@ -318,6 +379,8 @@ def doctor_cmd(args) -> int:
             print(_team_line(team))
         if sent:
             print(f"card 3: {state}")
+        for line in _workspace_lines(cfg, state if sent else None, why):
+            print(line)
     if not sent:
         print(f"report not sent: {why}", file=sys.stderr)
     return 0 if sent and not fixes else 1

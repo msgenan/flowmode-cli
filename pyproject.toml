@@ -1,6 +1,6 @@
 [project]
 name = "flowmode"
-version = "0.18.0"
+version = "0.19.0"
 description = "Flowmode command-line client: claims, overlap warnings, approvals and handoffs for coding agents"
 readme = "README.md"
 requires-python = ">=3.12"

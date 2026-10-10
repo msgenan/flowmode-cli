@@ -1,11 +1,19 @@
 """Id and timestamp helpers."""
 
 import secrets
+import string
 from datetime import UTC, datetime
+
+WORKSPACE_ID_ALPHABET = string.ascii_lowercase + string.digits
 
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(8)}"
+
+
+def new_workspace_id() -> str:
+    """S19 L-6: a workspace's public id, 8 random characters [a-z0-9] (the integer `workspaces.id` stays internal)."""
+    return "".join(secrets.choice(WORKSPACE_ID_ALPHABET) for _ in range(8))
 
 
 def now_iso() -> str:

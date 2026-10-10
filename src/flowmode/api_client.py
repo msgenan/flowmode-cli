@@ -94,8 +94,9 @@ class ApiClient:
             answer = {}
         return r.status_code, answer if isinstance(answer, dict) else {}
 
-    def device_start(self, name: str) -> tuple[int, dict]:
-        return self._device("/auth/device/start", {"name": name})
+    def device_start(self, name: str, workspace: str | None = None, repo: str | None = None) -> tuple[int, dict]:
+        """S19 §4.3: `workspace` (an id) or the clone's `repo` say which membership the token is for."""
+        return self._device("/auth/device/start", {"name": name, **_params(workspace=workspace, repo=repo)})
 
     def device_poll(self, handle: str) -> tuple[int, dict]:
         return self._device("/auth/device/poll", {"handle": handle})

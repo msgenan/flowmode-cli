@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 from flowmode.api_client import ApiClient, ApiError, ServerUnreachable
-from flowmode.member_config import load_member_config
+from flowmode.member_config import WorkspaceUnclear, load_member_config
 
 WATCH_EVERY = 5.0
 AGENT_NAMES = ("claude", "codex")
@@ -215,13 +215,17 @@ def watch(pid: int, start: str, cache: Path, every: float = WATCH_EVERY) -> int:
     final = _settled(cache)
     if not isinstance(final, dict) or final.get("session_id") != session_id or final.get("watcher_pid") != me:
         return 0
-    _end(session_id)
+    _end(session_id, final.get("root"))
     _forget(cache, session_id, me)
     return 0
 
 
-def _end(session_id: str) -> None:
-    cfg = load_member_config()
+def _end(session_id: str, root: object = None) -> None:
+    """End the session with the token its hook used (S19: picked by the session's clone, never the CLI flag)."""
+    try:
+        cfg = load_member_config(cwd=Path(root) if isinstance(root, str) else None, cli_flag=False)
+    except WorkspaceUnclear:
+        return
     if cfg is None:
         return
     client = ApiClient(cfg.server_url, cfg.token, timeout=cfg.request_timeout_seconds)

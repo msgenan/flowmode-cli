@@ -21,7 +21,7 @@ from flowmode.github_cli import (
     issue_view,
 )
 from flowmode.ids import now_iso
-from flowmode.member_config import MemberConfig, load_member_config, old_token_hint
+from flowmode.member_config import MemberConfig, load_member_config, old_token_hint, workspace_refusal
 from flowmode.paths import symlink_on_the_way, write_no_follow
 from flowmode.refs import printable, valid_ref_name
 from flowmode.repo import RepoInfo, canonical_repo, find_repo, origin_url, relative_path
@@ -103,6 +103,8 @@ def api_failure(exc: Exception, cfg: MemberConfig) -> Failed:
         return Failed(f"could not reach {cfg.server_url} ({exc})")
     if isinstance(exc, ApiError) and exc.status == 401:
         return Failed(f"token rejected by {cfg.server_url}")
+    if isinstance(exc, ApiError) and (refusal := workspace_refusal(exc.status, exc.detail)):  # S19: never names it
+        return Failed(refusal)
     return Failed(exc.detail if isinstance(exc, ApiError) else str(exc))
 
 

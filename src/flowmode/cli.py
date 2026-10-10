@@ -8,7 +8,8 @@ from flowmode import __version__
 from flowmode.shared import DEVICE_PAGE, DEVICE_TOKEN_PREFIX
 
 INSTALLABLE_AGENTS = ["claude", "codex"]
-SERVER_COMMANDS = ("serve", "member", "modules")  # run by `server_cli`, which the client build does not ship (L-2)
+# run by `server_cli`, which the client build does not ship (L-2); S19 adds `workspace`
+SERVER_COMMANDS = ("serve", "member", "modules", "workspace")
 REPO_HELP = "any directory inside the checkout (default: current directory)"
 TARGET_HELP = "task id (tsk_…, works from any directory) or task name in the repo of --repo"
 # S17 F-17-31 (D-7): `flowmode init` is gone; this is what is left of it
@@ -499,6 +500,12 @@ def _server_cli():
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="flowmode")
     parser.add_argument("--version", action="version", version=f"flowmode {__version__}")
+    parser.add_argument(  # S19 §4.4: a global option (dest apart from the server commands' own --workspace)
+        "--workspace",
+        dest="cli_workspace",
+        metavar="ID",
+        help="the workspace (an id from config.toml) this command is for, when the clone's origin does not say",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     login = commands.add_parser(
         "login",
@@ -810,24 +817,13 @@ def _terminal_safe(text: object) -> str:
     return display_safe(str(text))
 
 
-def _file_config() -> dict:
-    """config.toml as it is on disk (the environment's overrides left out); {} when missing or unreadable."""
-    import tomllib
-
-    from flowmode.member_config import config_path
-
-    try:
-        return tomllib.loads(config_path().read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
-        return {}
-
-
 LOGIN_HINT = (
     'Shells or tools that exported the old token still use it: run eval "$(flowmode env)" there again,'
     " or open a new terminal."
 )
 LOGIN_INTERVAL_MAX = 600
 USER_CODE = r"[A-Za-z0-9-]{1,32}"
+WORKSPACE_ID = r"[a-z0-9]{8}"  # S19 L-6: a workspace's public id
 
 
 def _login_refusal(server: str, status: int, body: dict) -> str:
@@ -835,6 +831,16 @@ def _login_refusal(server: str, status: int, body: dict) -> str:
     word = body.get("status")
     if status == 403 and word == "not_invited":
         return "No project yet: start one or ask for an invite. This GitHub account is not on the team; ask a team leader to invite you."
+    if status == 409 and word == "workspace_required":  # S19 §4.3: several memberships, the clone named none
+        listed = body.get("workspaces") if isinstance(body.get("workspaces"), list) else []
+        named = ", ".join(
+            f"{_terminal_safe(w.get('id'))} ({_terminal_safe(w.get('name'))})" for w in listed if isinstance(w, dict)
+        )
+        return f"you are in several workspaces: run flowmode --workspace <id> login, one of: {named or '-'}"
+    if status == 403 and word == "no_workspace":
+        return "No project yet: start one or ask for an invite. This GitHub account is in no workspace on this server."
+    if status == 404 and word == "not_found":
+        return "no workspace with that id is yours on this server; run flowmode login without --workspace"
     if status == 410 and word == "denied":
         return "the sign-in was denied on GitHub; run flowmode login again"
     if status == 410:
@@ -861,8 +867,9 @@ def _login(args: argparse.Namespace) -> int:
     import time
 
     from flowmode.api_client import ApiClient, ServerUnreachable
+    from flowmode.member_config import read_config_file
 
-    old = _file_config()
+    old = read_config_file()
     server = (args.server or str(old.get("server_url") or "")).rstrip("/")
     if not server:
         print("error: no server: pass --server https://… (config.toml names none)", file=sys.stderr)
@@ -876,12 +883,21 @@ def _login(args: argparse.Namespace) -> int:
     if not os.environ.get("FLOWMODE_HOME") and not args.yes and (refusal := _init_address_refusal(server)):
         print(f"error: {refusal}", file=sys.stderr)  # before any request: a refused login never uses a code
         return 1
+    flag = getattr(args, "cli_workspace", None)
+    if flag is not None and not re.fullmatch(WORKSPACE_ID, flag):  # SR-12: before any request
+        print("error: --workspace takes a workspace id (8 lowercase letters or digits)", file=sys.stderr)
+        return 1
     name = args.name if args.name is not None else socket.gethostname().split(".")[0][:64]
     if args.code is not None:
         return _login_code(args, server, name, old)
+    from pathlib import Path
+
+    from flowmode.repo import find_repo
+    from flowmode.shared import public_repo
+
     client = ApiClient(server, None, timeout=15.0)
     try:
-        status, started = client.device_start(name)
+        status, started = client.device_start(name, flag, public_repo(find_repo(Path.cwd()).origin))
         if status != 200:
             print(f"error: {_login_refusal(server, status, started)}", file=sys.stderr)
             return 1
@@ -919,8 +935,16 @@ def _login(args: argparse.Namespace) -> int:
 
 def _login_save(args: argparse.Namespace, server: str, name: str, old: dict, answer: dict, *, with_login: bool) -> int:
     """The tail both sign-ins share: check the device token, back the old config up, write the new one (0600), the
-    `eval` hint and the env-override warning (the device flow's answer also names the GitHub login)."""
-    from flowmode.member_config import MemberConfig, backup_member_config, save_member_config
+    `eval` hint and the env-override warning (the device flow's answer also names the GitHub login). S19 §4.4: the
+    answer's `workspace` gets its `[workspaces.<id>]` entry, added or replaced; every other entry of the same server
+    stays (a v0.18 file's token gets its own entry first, its workspace named by `/api/me`)."""
+    from flowmode.member_config import (
+        MemberConfig,
+        backup_member_config,
+        save_member_config,
+        upsert_workspace,
+        workspace_entries,
+    )
 
     token, device = answer.get("token"), answer.get("device")
     if not isinstance(token, str) or not token.startswith(DEVICE_TOKEN_PREFIX) or not token.isascii():
@@ -933,17 +957,68 @@ def _login_save(args: argparse.Namespace, server: str, name: str, old: dict, ans
         cfg = MemberConfig(server_url=server, token=token, approval_timeout_seconds=timeout)
     except (TypeError, ValueError):
         cfg = MemberConfig(server_url=server, token=token)
+    workspace = _named_workspace(answer.get("workspace"))
+    same_server = str(old.get("server_url") or "").rstrip("/") == server  # another server's tokens do not carry over
+    if workspace is None and same_server and workspace_entries(old):  # SR-13: never drop another entry
+        print(f"error: {server} did not name the token's workspace; config.toml is unchanged", file=sys.stderr)
+        return 1
+    kept = _old_token_entry(server, old) if workspace is not None and same_server else {}
     backup = backup_member_config()
-    path = save_member_config(cfg)
+    path = upsert_workspace(cfg, *workspace, kept) if workspace is not None else save_member_config(cfg)
     device_label = _terminal_safe(device.get("name") if isinstance(device, dict) else name)
     member = _terminal_safe(answer.get("member"))
     who = f"@{_terminal_safe(answer.get('login'))} (member {member})" if with_login else f"member {member}"
-    print(f"Signed in as {who} on device {device_label}")
+    where = f" in workspace {_terminal_safe(workspace[1])} ({workspace[0]})" if workspace is not None else ""
+    print(f"Signed in as {who} on device {device_label}{where}")
     print(f"config: {path}" + (f" (backup: {backup})" if backup is not None else ""))
     print(LOGIN_HINT)
     if warning := _env_override_warning(cfg):
         print(warning, file=sys.stderr)
     return 0
+
+
+def _named_workspace(named: object) -> tuple[str, str, str | None] | None:
+    """(id, name, repo) of a sign-in answer's or `/api/me`'s `workspace`; None when it names none (an older server)."""
+    import re
+
+    if (
+        not isinstance(named, dict)
+        or not isinstance(named.get("id"), str)
+        or not re.fullmatch(WORKSPACE_ID, named["id"])
+    ):
+        return None
+    name, repo = named.get("name"), named.get("repo")
+    return named["id"], name if isinstance(name, str) else "", repo if isinstance(repo, str) and repo else None
+
+
+def _old_token_entry(server: str, old: dict) -> dict:
+    """S19 §4.4, K-7: a v0.18 file (a device token at the top, no workspace tables), or a file whose top-level token
+    is an orphan (`orphan_token`: no entry holds it), with that token's own entry added first — `/api/me` names the
+    workspace — so the next login keeps it chosen in its clones. A token the server rejects
+    (401: revoked or unknown) is dropped, as a v0.18 login replaced it; anything else, or a server that does not
+    answer, leaves `old` as it is (the token stays at the top level)."""
+    from flowmode.api_client import ApiClient, ApiError, ServerUnreachable
+    from flowmode.member_config import orphan_token, workspace_entries
+
+    entries = workspace_entries(old)
+    token = old.get("token") if not entries else orphan_token(old)
+    if not isinstance(token, str) or not token.startswith(DEVICE_TOKEN_PREFIX):
+        return old
+    client = ApiClient(server, token, timeout=5.0)
+    try:
+        named = _named_workspace(client.me().get("workspace"))
+    except ApiError as exc:
+        return {**old, "token": ""} if exc.status == 401 else old
+    except (ServerUnreachable, AttributeError):
+        return old
+    finally:
+        client.close()
+    if named is None:
+        return old
+    wid, name, repo = named
+    if wid in entries:  # its workspace already has an entry: the orphan leaves the top level, that entry stays
+        return {**old, "token": ""}
+    return {**old, "workspaces": {wid: {"name": name, "repo": repo, "token": token}, **entries}}
 
 
 def _login_code(args: argparse.Namespace, server: str, name: str, old: dict) -> int:
@@ -985,11 +1060,16 @@ def _logout(args: argparse.Namespace) -> int:
     """S14 F-14-13 criterion 5: `DELETE /api/account/devices/current` with this device's token, then the token
     leaves config.toml (backup first, without the token). A server that cannot be reached does not keep the token
     here, and the CLI says the token still works there until it is revoked on the web."""
-    from flowmode.api_client import ApiClient, ApiError, ServerUnreachable
-    from flowmode.member_config import config_path, old_token_hint, remove_member_token
+    from pathlib import Path
 
-    data = _file_config()
-    token, server = data.get("token"), str(data.get("server_url") or "")
+    from flowmode.api_client import ApiClient, ApiError, ServerUnreachable
+    from flowmode.member_config import config_path, old_token_hint, pick_entry, read_config_file, remove_member_token
+    from flowmode.repo import find_repo
+
+    data = read_config_file()
+    server = str(data.get("server_url") or "")
+    # S19 §4.4: the entry of the chosen workspace (--workspace, the clone's origin, the only one) goes; others stay
+    _wid, token = pick_entry(data, getattr(args, "cli_workspace", None), lambda: find_repo(Path.cwd()).origin)
     if not isinstance(token, str) or not token:
         print(f"error: not signed in on this device (no token in {config_path()})", file=sys.stderr)
         return 1
@@ -1020,7 +1100,7 @@ def _logout(args: argparse.Namespace) -> int:
         said = "Signed out on this machine only: the token is still valid on the server; revoke it on the web"
     finally:
         client.close()
-    backup = remove_member_token()
+    backup = remove_member_token(token)
     print(said)
     kept = f" (backup, without the token: {backup})" if backup is not None else ""
     print(f"config: token removed from {config_path()}{kept}")
@@ -1427,6 +1507,9 @@ def _fix(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from flowmode.member_config import WorkspaceUnclear, choose_workspace
+
+    choose_workspace(None)  # S19: no earlier in-process command's --workspace survives a parse error or --help
     first = (sys.argv[1:] if argv is None else argv)[:1]
     if first == ["init"]:  # S17 D-7: any `init …`, before argparse
         print(f"error: {INIT_GONE}", file=sys.stderr)
@@ -1442,6 +1525,15 @@ def main(argv: list[str] | None = None) -> int:
         return int(e.code or 0)
     if server is not None and args.command in SERVER_COMMANDS:
         return server.run(args)
+    choose_workspace(args.cli_workspace)
+    try:
+        return _client_command(parser, args)
+    except WorkspaceUnclear as exc:  # S19 §4.4: raised before any request
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _client_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if args.command == "login":
         return _login(args)
     if args.command == "logout":

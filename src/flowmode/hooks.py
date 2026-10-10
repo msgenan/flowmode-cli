@@ -25,7 +25,7 @@ from flowmode.checks import (
     remember_conflicts,
 )
 from flowmode.limits import MAX_COMMAND_LEN, MAX_PATH_LEN
-from flowmode.member_config import MemberConfig, load_member_config
+from flowmode.member_config import MemberConfig, WorkspaceUnclear, load_member_config, workspace_refusal
 from flowmode.paths import claim_path
 from flowmode.redact import redact_secrets
 from flowmode.repo import RepoInfo, find_repo, is_checkout, relative_path
@@ -173,7 +173,10 @@ class BrokenCheckout(Exception):
 
 
 def handle(req: HookRequest) -> HookResponse:
-    cfg = load_member_config()
+    try:  # S19 §4.4: the token of the workspace whose repo is this clone's origin (a hook takes no --workspace)
+        cfg = load_member_config(cwd=req.cwd, cli_flag=False)
+    except WorkspaceUnclear as exc:  # several workspaces, none for this clone: say so, then act as offline
+        return _offline(req, f"{UNCLEAR_WORKSPACE} ({exc})", None, unclear=True)
     if cfg is None:
         return _offline(req, "not configured", None)
     client = ApiClient(cfg.server_url, cfg.token, timeout=cfg.request_timeout_seconds)
@@ -182,11 +185,44 @@ def handle(req: HookRequest) -> HookResponse:
     except BrokenCheckout as exc:
         return _moved(req, exc)
     except (ServerUnreachable, ApiError) as exc:
+        if isinstance(exc, ApiError) and (refusal := workspace_refusal(exc.status, exc.detail)):
+            return _wrong_workspace(req, refusal, cfg)
         if not _is_offline(exc):
             raise
         return _offline(req, _offline_label(exc), cfg)
     finally:
         client.close()
+
+
+UNCLEAR_WORKSPACE = "no workspace chosen for this clone"
+WRONG_WORKSPACE = "wrong workspace"
+
+
+def _wrong_workspace(req: HookRequest, refusal: str, cfg: MemberConfig) -> HookResponse:
+    """S19 L-12: a 403/409 workspace refusal. The first hook of the session says it in one line (session start: in
+    the context and on stderr); from then on every hook behaves as when the server is unreachable — an edit goes
+    through unrecorded, a risky command is denied; nothing new is blocked. The line names neither the repo nor the
+    other workspace. The "said" mark is merged into the session's cache file: with no session yet it holds only the
+    mark (no session id: nothing is cached); a session registered earlier keeps its id and watcher, so the watcher
+    still ends it on the server (as offline hooks leave it today)."""
+    path = _cache_path(req)
+    try:
+        cache = json.loads(path.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    cache = cache if isinstance(cache, dict) else {}
+    if cache.get("wrong_workspace") is True:
+        return _offline(req, WRONG_WORKSPACE, cfg)
+    try:  # merged into the cache: a live session keeps its id and watcher, which ends it on the server later
+        path.parent.mkdir(parents=True, exist_ok=True)
+        watcher.write_cache(path, {**cache, "wrong_workspace": True})
+    except OSError:
+        pass  # the line is said again next time: never a reason to fail a hook
+    line = f"Flowmode: {refusal}; team context unavailable and file claims are not enforced in this session."
+    if req.event == "session-start":
+        return HookResponse(context=line, stderr=line)
+    response = _offline(req, WRONG_WORKSPACE, cfg)
+    return response if response.reason else HookResponse(stderr=line)
 
 
 def _moved(req: HookRequest, exc: BrokenCheckout) -> HookResponse:
@@ -219,15 +255,20 @@ def _offline_label(exc: Exception) -> str:
     return "token rejected" if isinstance(exc, ApiError) else "server unreachable"
 
 
-def _offline(req: HookRequest, label: str, cfg: MemberConfig | None) -> HookResponse:
+def _offline(req: HookRequest, label: str, cfg: MemberConfig | None, unclear: bool = False) -> HookResponse:
+    """`unclear` (S19): no config was chosen because several workspaces leave the choice open — the person hears
+    `label`, not "not connected"."""
     if req.event == "session-start":
+        if unclear:
+            line = f"Flowmode: {label}; team context unavailable and file claims are not enforced."
+            return HookResponse(context=line, stderr=line)
         if cfg is None:
             return HookResponse(context=NOT_CONFIGURED_CONTEXT)
         return HookResponse(
             context=f"Flowmode: {label} ({cfg.server_url}); team context unavailable and file"
             " claims are not enforced until it is back."
         )
-    hint = NOT_CONNECTED_HINT if cfg is None else label
+    hint = NOT_CONNECTED_HINT if cfg is None and not unclear else label
     if req.event == "pre-tool-use" and req.file_paths:
         reason = f"Flowmode: {hint}, claim not recorded"
         return HookResponse(decision="allow", reason=reason, stderr=reason)
