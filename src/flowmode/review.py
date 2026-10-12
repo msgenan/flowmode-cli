@@ -13,7 +13,7 @@ merge card, never a lock (security.md R-5, R-7, R-10).
 S12 F-12-13b: `followups`, after the merge only, reads the `## Follow-ups` drafts of the pull request's description
 (the server's webhook row, else the member's own `gh pr view --json body`, which never goes to the server), refuses a
 draft that is a blocking item of the review, proposes the rest and lists them; `followups --open` opens, with the
-member's own gh, only the rows the person approved on the site with their approver key (Open all, D-17)."""
+member's own gh, only the rows the person approved on the site, signed in with GitHub (Open all, D-17)."""
 
 import contextlib
 import os
@@ -46,7 +46,7 @@ from flowmode.github_cli import (
 )
 from flowmode.ids import now_iso
 from flowmode.redact import redact_secrets
-from flowmode.refs import printable
+from flowmode.refs import printable, terminal_safe
 from flowmode.repo import find_repo
 from flowmode.repo_config import FILE_NAME as REPO_CONFIG
 from flowmode.repo_config import load_repo_config
@@ -507,7 +507,7 @@ def _open(args, cfg, checkout) -> None:
         if args.to:
             state = client.pass_review(task["id"], args.to)
             print(
-                f"review: #{n} passed to {state['passed']['to']} — waiting for {args.to} to accept"
+                f"review: #{n} passed to {terminal_safe(state['passed']['to'])} — waiting for {args.to} to accept"
                 f" (flowmode review accept {n})"
             )
             return
@@ -581,7 +581,7 @@ def _open(args, cfg, checkout) -> None:
         agent = _agent()
     launch = f"cd {shlex.quote(str(path))} && {agent}"
     print(f"review: #{n} {title}")
-    print(f"task: {task['name']} ({task['owner']}'s)")
+    print(f"task: {terminal_safe(task['name'])} ({terminal_safe(task['owner'])}'s)")
     print(f"worktree: {path}")
     print(f"prompt: {prompt}")
     if config:
@@ -687,7 +687,7 @@ def _pass(args, cfg) -> None:
     with _client(cfg) as client:
         state = client.pass_review(entry["task_id"], args.arg, up_to_date_with(root, default))
     print(
-        f"review: #{entry['pr']} passed to {state['passed']['to']} — waiting for {args.arg} to accept"
+        f"review: #{entry['pr']} passed to {terminal_safe(state['passed']['to'])} — waiting for {args.arg} to accept"
         f" (flowmode review accept {entry['pr']})"
     )
 
@@ -705,7 +705,7 @@ def _answer(args, cfg, action: str) -> None:
     if action == "accept":
         print(f"review: #{number} is yours now — open it with  flowmode review {number}")
     elif action == "decline":
-        print(f"review: #{number} declined; it stays with {state['holder']}")
+        print(f"review: #{number} declined; it stays with {terminal_safe(state['holder'])}")
     else:
         print(f"review: #{number} is back with you")
 
@@ -759,7 +759,7 @@ NO_MERGE = (
 WAITING = "waiting for your open on the site (or run  flowmode review followups --open  after saying open)"
 NOTHING_APPROVED = (
     "nothing approved yet — your person decides the whole list with Open all on the task's Done card"
-    " (signed in with their approver key)"
+    " (signed in with GitHub on the site)"
 )
 MAX_LABELS = 10
 
@@ -895,10 +895,10 @@ def _row_line(row: dict, local: list[tuple[str, list[dict]]]) -> str:
         "dropped": "dropped",
     }.get(row["status"])
     if row["status"] == "opened":
-        state = f"opened {row.get('issue_repo')}#{row.get('issue_number')}"
-    return (
-        f"follow-up {row['id']}: {row['module']}: {row['title']} — "
-        f"{'owner ' + owner if owner else 'no owner known'} — {state}"
+        state = f"opened {terminal_safe(row.get('issue_repo'))}#{terminal_safe(row.get('issue_number'))}"
+    return (  # S20 F-20-90: every server field through the one terminal filter
+        f"follow-up {terminal_safe(row['id'])}: {terminal_safe(row['module'])}: {terminal_safe(row['title'])} — "
+        f"{'owner ' + terminal_safe(owner) if owner else 'no owner known'} — {state}"
     )
 
 
@@ -953,7 +953,16 @@ def _record_opened(client, task: dict, row: dict, url: str, verb: str = "opened"
     except (ApiError, ServerUnreachable) as exc:
         why = exc.detail if isinstance(exc, ApiError) else str(exc)
         raise Failed(f"{verb} {url} but could not record it ({why}) — {RERUN}")
-    print(f"{verb} {done['issue_repo']}#{done['issue_number']}: {row['module']}: {row['title']} — {done['issue_url']}")
+    print(
+        f"{verb} {terminal_safe(done['issue_repo'])}#{terminal_safe(done['issue_number'])}: "
+        f"{terminal_safe(row['module'])}: {terminal_safe(row['title'])} — {web_address(done['issue_url'])}"
+    )
+
+
+def web_address(url: object) -> str:
+    """S20 F-20-90: a server-given address as shown: only an http(s) one, through the terminal filter."""
+    shown = terminal_safe(url)
+    return shown if re.match(r"https?://[^\s]+$", shown, re.ASCII) else "(no web address: not http or https)"
 
 
 def _release(client, task: dict, row: dict) -> None:
@@ -973,9 +982,9 @@ def _find_left(client, task: dict, github: str, root: Path, row: dict) -> bool:
         raise Failed(f"could not look up follow-up {row['id']}'s issue with gh: {exc}")
     if url is None:
         print(
-            f"follow-up {row['id']}: being opened by another run, or an earlier run stopped — no issue on {github}"
+            f"follow-up {terminal_safe(row['id'])}: being opened by another run, or an earlier run stopped — no issue on {github}"
             " carries its marker yet; nothing opened for it. If no issue was opened for it, give it back:"
-            f"  flowmode review followups --release {row['id']}"
+            f"  flowmode review followups --release {terminal_safe(row['id'])}"
         )
         return False
     _record_opened(client, task, row, url, "found")
@@ -996,7 +1005,7 @@ def _open_one(
         client.followup_opening(task["id"], row["id"])  # the claim: of two runs, one opens the issue
     except ApiError as exc:
         if exc.status == 409:
-            print(f"follow-up {row['id']}: {exc.detail} — skipped")
+            print(f"follow-up {row['id']}: {terminal_safe(exc.detail)} — skipped")
             return
         raise Failed(f"could not claim follow-up {row['id']} ({exc.detail})")
     except ServerUnreachable as exc:
@@ -1059,7 +1068,7 @@ def _release_left(client, task: dict, rows: list[dict], fid: str) -> None:
     if row["status"] != "opening":
         raise Failed(f"follow-up {fid} is {row['status']}, not being opened — nothing to give back")
     prompt = (
-        f"Give back follow-up {fid} ({row['module']}: {row['title']})? Only when no issue for it is on GitHub:"
+        f"Give back follow-up {fid} ({terminal_safe(row['module'])}: {terminal_safe(row['title'])})? Only when no issue for it is on GitHub:"
         " the next --open opens a new one. [y/N] "
     )
     try:

@@ -141,7 +141,19 @@ def spawn(pid: int, start: str, cache: Path) -> int | None:
     a child holding the hook's stdout pipe would hang the hook (and the agent) until it exits (`code.md` §3.3)."""
     try:
         child = subprocess.Popen(
-            [sys.executable, "-m", "flowmode", "watch", "--pid", str(pid), "--start", start, "--cache", str(cache)],
+            [
+                sys.executable,
+                "-P",
+                "-m",
+                "flowmode",
+                "watch",
+                "--pid",
+                str(pid),
+                "--start",
+                start,
+                "--cache",
+                str(cache),
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

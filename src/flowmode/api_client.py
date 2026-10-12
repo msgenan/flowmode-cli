@@ -6,6 +6,9 @@ import httpx
 # server sends it, the hooks show it as is (from the 401 and this detail); it lives here so the hooks need not import
 # the server side.
 OLD_TOKEN_DETAIL = "old tokens are turned off; run flowmode login"  # noqa: S105 — a message, not a secret
+# S20 C1c (F-20-96, walkthrough F13): the 401 detail for a device token whose membership ended (the person was removed
+# or left): no guess, so the CLI can say "you are no longer in workspace <name>" instead of "token rejected".
+MEMBERSHIP_ENDED_DETAIL = "membership ended: this device's workspace membership was removed or left"
 
 # S10 F-10-06: heartbeats and note lookups are best effort — a stuck server must not hold the agent for long.
 BEST_EFFORT_TIMEOUT = httpx.Timeout(connect=1.0, read=2.0, write=2.0, pool=1.0)
@@ -51,11 +54,17 @@ class ApiClient:
             timeout=timeout,
             transport=transport,
         )
+        # S20 F-20-99: a call made with the member's own timeout timed out (the hook remembers it). A refused
+        # connection does not set it: it fails in milliseconds, and remembering it would keep claims unrecorded for
+        # the window after the server is back (D5 1f). A best-effort call (its own short `timeout`) never sets it.
+        self.transport_failed = False
 
     def _request(self, method: str, path: str, **kwargs) -> tuple[int, object]:
         try:
             r = self._http.request(method, path, **kwargs)
         except (httpx.TimeoutException, httpx.NetworkError) as exc:  # ConnectError is a NetworkError
+            if isinstance(exc, httpx.TimeoutException) and "timeout" not in kwargs:
+                self.transport_failed = True
             raise ServerUnreachable(str(exc) or type(exc).__name__) from exc
         if r.status_code >= 500:
             raise ServerUnreachable(f"server error {r.status_code}")
@@ -108,6 +117,10 @@ class ApiClient:
     def revoke_current_device(self) -> dict:
         return self._request("DELETE", "/account/devices/current")[1]
 
+    def health(self) -> dict:
+        """S20 L-10: `{"status", "version"}` — the server's release (no token needed)."""
+        return self._get("/health")
+
     def config(self) -> dict:
         return self._get("/config")
 
@@ -143,6 +156,10 @@ class ApiClient:
     def claim(self, session_id, path, ttl_seconds=None) -> tuple[int, dict]:
         return self._request("POST", "/claims", json=_params(session_id=session_id, path=path, ttl_seconds=ttl_seconds))
 
+    def release_claim(self, session_id, path) -> dict:
+        """S20 C1a (walkthrough F6): give back a claim this session made for a command that never ran."""
+        return self._post("/claims/release", {"session_id": session_id, "path": path}, best_effort=True)
+
     def list_sessions(self, repo=None, member=None, status=None) -> list[dict]:
         return self._get("/sessions", repo=repo, member=member, status=status)
 
@@ -152,8 +169,8 @@ class ApiClient:
     def list_claim_denials(self, limit=None) -> list[dict]:
         return self._get("/claims/denied", limit=limit)
 
-    def list_plans(self, repo=None, session_id=None) -> list[dict]:
-        return self._get("/plans", repo=repo, session_id=session_id)
+    def list_plans(self, repo=None, session_id=None, latest=None) -> list[dict]:
+        return self._get("/plans", repo=repo, session_id=session_id, latest="true" if latest else None)
 
     def list_decisions(self, repo=None, session_id=None) -> list[dict]:
         return self._get("/decisions", repo=repo, session_id=session_id)
@@ -353,6 +370,14 @@ class ApiClient:
 
     def finish_task(self, task_id) -> dict:
         return self._post("/tasks/done", {"id": task_id})
+
+    def release_task(self, task_id, note=None) -> dict:
+        """S20 §4.4: the owner or a leader gives the task back to the team."""
+        return self._post(f"/tasks/{task_id}/release", _params(note=note))
+
+    def take_task(self, task_id) -> dict:
+        """S20 §4.4: take a released task (you become its owner)."""
+        return self._post(f"/tasks/{task_id}/take")
 
     def take_handoff(self, handoff_id, session_id=None) -> dict:
         """{"handoff", "claims", "skipped"}."""

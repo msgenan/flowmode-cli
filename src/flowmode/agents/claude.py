@@ -13,6 +13,8 @@ READ_TOOL = "Read"  # S11 F-11-28: a finished Read gives HookRequest.read_path o
 COMMAND_TOOLS = ("Bash",)
 HOOK_PREFIX = "flowmode hook "
 TOOL_MATCHER = "Edit|Write|MultiEdit|NotebookEdit|Bash"
+# S20 L-6 (a): Claude's own attribution settings, turned off in the project settings by `flowmode install claude`
+ATTRIBUTION_OFF: dict = {"attribution": {"commit": "", "pr": ""}, "includeCoAuthoredBy": False}
 MCP_PREFIX = "mcp__flowmode__"  # Claude's name for the tools of the `flowmode` MCP server (.mcp.json)
 # S9 §4.2 / §3.2: the hooks also look at these Flowmode MCP calls
 PRE_MATCHER = TOOL_MATCHER + f"|{MCP_PREFIX}release"
@@ -114,6 +116,16 @@ def _failed(response) -> bool:
     return isinstance(response, dict) and bool(response.get("isError") or response.get("is_error"))
 
 
+def new_file_text(tool_input: dict) -> str:
+    """The text a file tool would write: Write's `content`, Edit's `new_string`, MultiEdit's `edits[].new_string`,
+    NotebookEdit's `new_source` (S20 F-20-81 reads it for hooksPath)."""
+    parts = [tool_input.get(k) for k in ("content", "new_string", "new_source")]
+    edits = tool_input.get("edits")
+    if isinstance(edits, list):
+        parts += [e.get("new_string") for e in edits if isinstance(e, dict)]
+    return "\n".join(p for p in parts if isinstance(p, str))
+
+
 class ClaudeAdapter:
     name = "claude"
     skills_dir = ".claude/skills"  # S11 F-11-01: where the shipped skills go
@@ -125,9 +137,10 @@ class ClaudeAdapter:
         cwd = Path(data["cwd"]) if isinstance(data.get("cwd"), str) and data["cwd"] else Path.cwd()
         tool_name = data.get("tool_name") if isinstance(data.get("tool_name"), str) else None
         tool_input = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
-        file_paths, command = [], None
+        file_paths, command, new_text = [], None, ""
         if tool_name in FILE_FIELDS and isinstance(tool_input.get(FILE_FIELDS[tool_name]), str):
             file_paths = [tool_input[FILE_FIELDS[tool_name]]]
+            new_text = new_file_text(tool_input)
         elif tool_name in COMMAND_TOOLS and isinstance(tool_input.get("command"), str):
             command = tool_input["command"]
         read_path = None
@@ -152,10 +165,18 @@ class ClaudeAdapter:
             tool_input=tool_input if mcp_tool else {},
             tool_failed=_failed(data.get("tool_response")),
             tool_response=data["tool_response"] if isinstance(data.get("tool_response"), dict) else {},
+            new_text=new_text,
+            file_input=tool_input if file_paths else {},
         )
 
     def render(self, req: HookRequest, resp: HookResponse) -> HookResult:
         stderr = resp.stderr + "\n" if resp.stderr else ""
+        message = {}
+        if resp.notice:  # S20 L-10, C1e: Claude Code shows `systemMessage` to the person, Codex gets stderr
+            if self.name == "claude":
+                message = {"systemMessage": resp.notice}
+            else:
+                stderr += resp.notice + "\n"
         if resp.decision is not None:
             out = {
                 "hookEventName": "PreToolUse",
@@ -167,8 +188,9 @@ class ClaudeAdapter:
         elif req.event == "post-tool-use" and resp.context:  # notes to this agent (S7 §9)
             out = {"hookEventName": "PostToolUse", "additionalContext": resp.context}
         else:
-            return HookResult(exit_code=0, stdout="", stderr=stderr)
-        return HookResult(exit_code=0, stdout=json.dumps({"hookSpecificOutput": out}) + "\n", stderr=stderr)
+            stdout = json.dumps(message) + "\n" if message else ""
+            return HookResult(exit_code=0, stdout=stdout, stderr=stderr)
+        return HookResult(exit_code=0, stdout=json.dumps({**message, "hookSpecificOutput": out}) + "\n", stderr=stderr)
 
     def install(self, repo: Path, cfg: MemberConfig) -> tuple[list[Path], list[str]]:
         """Merge hooks into <repo>/.claude/settings.json and the MCP server into <repo>/.mcp.json."""
@@ -176,8 +198,20 @@ class ClaudeAdapter:
         refuse_links(repo, settings_path, mcp_path)
         settings, mcp = read_json(settings_path), read_json(mcp_path)  # validate both before writing either
         settings["hooks"] = merge_hooks(settings.get("hooks") or {}, flowmode_hook_groups(self.name))
+        # S20 L-6 (a): Claude adds no co-author trailer or "Generated with" line to commits and pull requests
+        replaced = [k for k, v in ATTRIBUTION_OFF.items() if k in settings and settings[k] != v]
+        settings.update(ATTRIBUTION_OFF)
         write_json(settings_path, settings)
         write_json(mcp_path, merge_mcp(mcp, cfg.server_url))
+        note = (
+            f"note: replaced your {', '.join(replaced)} in .claude/{settings_path.name}: this team's commits and pull"
+            " requests never name an agent as author or co-author"
+        )
+        notes = [note] if replaced else []
         return [settings_path, mcp_path], [
-            'next: export FLOWMODE_TOKEN in the shell that starts claude, e.g.  eval "$(flowmode env)"'
+            *notes,
+            (
+                "next: start with  flowmode work ; only if you start claude yourself, export FLOWMODE_TOKEN in that"
+                ' shell first, e.g.  eval "$(flowmode env)"'
+            ),
         ]

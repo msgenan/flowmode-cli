@@ -6,7 +6,8 @@
 #   ./setup.sh                   only install or update (after `git pull`)
 #
 # It installs uv when it is missing (Astral's installer, pinned version, downloaded to a temp file first), installs
-# the CLI with `uv tool install` from this folder with the dependency versions in uv.lock, and runs
+# the CLI with `uv tool install` from this folder with the dependency versions in uv.lock (the build backend
+# and its own dependencies are pinned exactly in pyproject.toml), and runs
 # `flowmode login`. It changes no shell file and never prints the code. Your own uv settings (UV_PYTHON,
 # UV_CACHE_DIR, UV_TOOL_DIR, UV_TOOL_BIN_DIR) are left as they are.
 set -eu

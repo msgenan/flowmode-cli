@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from flowmode.redact import redact_secrets
-from flowmode.risky import DEFAULT_RISKY_PATTERNS, is_risky, patterns_for
+from flowmode.risky import DEFAULT_RISKY_PATTERNS, RUNTIME_COMMAND, is_risky, patterns_for
 from flowmode.shared import flowmode_home
 from flowmode.worktrees import GitError, _git, fetch_branch, merge_tree_conflicts
 
@@ -104,6 +104,14 @@ def check_patterns(team_patterns: list[str] | None = None) -> list[str]:
     return patterns_for("strict", _normal_set(team_patterns))
 
 
+def _refused(command: str, patterns: list[str], team: bool) -> bool:
+    """A check line is not run when a risky pattern matches it. S20 F-20-88: a committed flowmode.toml line (`team`) is
+    team-reviewed and no stronger than a script, so a line the hook only cannot read statically (`$PYTHON -m pytest`,
+    `find … -exec bash -n {} +`) still runs; an agent's ad hoc `--also` line is refused for it too."""
+    found = is_risky(command, patterns)
+    return bool(found) and not (team and found == RUNTIME_COMMAND)
+
+
 def rows_for(
     commands: list[str],
     cwd: Path,
@@ -121,8 +129,8 @@ def rows_for(
     toml = toml_patterns() if risky_patterns is None else risky_patterns
     strict = check_patterns() if also_patterns is None else also_patterns
     rows = [
-        CheckRow("command", c, "failed", REFUSED) if is_risky(c, patterns) else run_command(c, cwd, timeout)
-        for c, patterns in [*((c, toml) for c in commands), *((c, strict) for c in also)]
+        CheckRow("command", c, "failed", REFUSED) if _refused(c, patterns, team) else run_command(c, cwd, timeout)
+        for c, patterns, team in [*((c, toml, True) for c in commands), *((c, strict, False) for c in also)]
     ]
     rows += [CheckRow("criterion", c, "open") for c in criteria(issue_body)]
     rows += [CheckRow("person", p, "open") for p in person_checks]

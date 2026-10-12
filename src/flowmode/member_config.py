@@ -15,16 +15,13 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator
 
-from flowmode.refs import display_safe
+from flowmode.api_client import MEMBERSHIP_ENDED_DETAIL
+from flowmode.refs import display_safe, terminal_safe
 from flowmode.repo import find_repo
 from flowmode.shared import flowmode_home, public_repo, same_repo
 
 # S17 F-17-31: the prefixes of the retired member tokens and approver keys (the server mints neither any more)
 OLD_TOKEN_PREFIXES = ("fm_", "fma_")
-
-
-class NotConfigured(Exception):
-    """No server URL + token from the config file or the environment (run `flowmode login --server <url>`)."""
 
 
 class WorkspaceUnclear(Exception):
@@ -71,6 +68,18 @@ def choose_workspace(workspace: str | None) -> None:
 def workspace_refusal(status: int, detail: object) -> str | None:
     """The one sentence for a 403/409 workspace refusal (never naming the other workspace); None for anything else."""
     return WORKSPACE_REFUSALS.get((status, detail)) if isinstance(detail, str) else None
+
+
+def token_rejected(cfg: MemberConfig, detail: object) -> str:
+    """S20 C1c (walkthrough F13): the one sentence for a 401 with its next step. A device whose membership ended
+    (`MEMBERSHIP_ENDED_DETAIL`: removed, or left) never comes back by itself: it names the workspace (its name as this
+    computer stored it, terminal-safe) and says to ask a leader; any other 401 says to sign this computer in again."""
+    again = f"flowmode login --server {cfg.server_url}"
+    if detail == MEMBERSHIP_ENDED_DETAIL:
+        name = terminal_safe(workspace_entries(read_config_file()).get(cfg.workspace or "", {}).get("name", ""), 80)
+        where = f"workspace {name}" if name else "this workspace"
+        return f"you are no longer in {where} on {cfg.server_url}: ask a leader for a new invitation, then run {again}"
+    return f"token rejected by {cfg.server_url}: sign this computer in again with {again}"
 
 
 def read_config_file() -> dict:

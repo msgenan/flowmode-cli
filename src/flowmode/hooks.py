@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,7 +17,7 @@ from time import monotonic
 from typing import Literal
 
 from flowmode import sync, watcher
-from flowmode.api_client import OLD_TOKEN_DETAIL, ApiClient, ApiError, ServerUnreachable
+from flowmode.api_client import MEMBERSHIP_ENDED_DETAIL, OLD_TOKEN_DETAIL, ApiClient, ApiError, ServerUnreachable
 from flowmode.checks import (
     HOOK_FETCH_TIMEOUT,
     conflicts_advice,
@@ -25,20 +26,46 @@ from flowmode.checks import (
     remember_conflicts,
 )
 from flowmode.limits import MAX_COMMAND_LEN, MAX_PATH_LEN
-from flowmode.member_config import MemberConfig, WorkspaceUnclear, load_member_config, workspace_refusal
+from flowmode.member_config import (
+    MemberConfig,
+    WorkspaceUnclear,
+    load_member_config,
+    token_rejected,
+    workspace_refusal,
+)
 from flowmode.paths import claim_path
 from flowmode.redact import redact_secrets
+from flowmode.refs import terminal_safe
 from flowmode.repo import RepoInfo, find_repo, is_checkout, relative_path
 from flowmode.repo_config import load_repo_config
 from flowmode.risky import (
+    AGENT_HOOKS_REFUSAL,
     DEFAULT_RISKY_PATTERNS,
+    FLOWMODE_HOME_REFUSAL,
+    HOOKS_GUARD_REFUSAL,
+    HOOKS_ON_REFUSAL,
+    MODES,
     STRICT_PATTERNS,
+    TASK_HANDS_REFUSAL,
+    UNCHECKED_REFUSAL,
+    agent_hooks_change,
+    attribution_findings,
+    attribution_refusal,
+    attribution_scope,
+    file_edit_tampers,
     is_risky,
     patterns_for,
     reason_for,
+    removes_agent_hooks,
     scopes,
+    skips_git_hooks,
+    takes_or_releases_task,
+    tampers_with_git_hooks,
+    unchecked_commit_text,
+    under_flowmode_home,
+    writes_flowmode_home,
 )
-from flowmode.shared import flowmode_home
+from flowmode.shared import TAKEN_NOTE_RE, client_outdated, flowmode_home
 from flowmode.shellwrites import effective_dir, write_targets
 from flowmode.task_registry import find_worktree, lookup_worktree
 from flowmode.worktrees import (
@@ -106,6 +133,8 @@ class HookRequest:
     tool_input: dict = field(default_factory=dict)  # that call's input (only for mcp_tool)
     tool_failed: bool = False  # post-tool-use: the tool reported an error
     tool_response: dict = field(default_factory=dict)  # post-tool-use: the tool's answer (S11 F-11-30: outcome fields)
+    new_text: str = ""  # pre-tool-use of a file tool: the text it would write (S20 F-20-81: hooksPath into git config)
+    file_input: dict = field(default_factory=dict)  # that file tool's input (F-20-88: the agent hooks' new text)
 
 
 @dataclass
@@ -114,6 +143,7 @@ class HookResponse:
     reason: str = ""
     context: str = ""
     stderr: str = ""
+    notice: str = ""  # a line for the person (S20 L-10): Claude Code's `systemMessage`, Codex's stderr
 
 
 @dataclass
@@ -139,10 +169,14 @@ def run_hook(event: str, agent: str, stdin_text: str) -> HookResult:
         return adapter.render(req, handle(req))
     except Exception as exc:  # noqa: BLE001 — a hook must never break the agent...
         stderr = f"flowmode hook: {exc}\n"
-        if req is not None and _fails_closed(req):  # ...but a risky command fails closed (S2 §12.2)
+        if req is not None:  # ...but a local refusal stands and a risky command fails closed (S2 §12.2, F-20-88)
             try:
-                result = adapter.render(req, _risky_denied(req.command, f"error ({exc})"))
-                return HookResult(exit_code=0, stdout=result.stdout, stderr=stderr + result.stderr)
+                denied = _local_refusal(req) if req.event == "pre-tool-use" else None
+                if denied is None and _fails_closed(req):
+                    denied = _risky_denied(req.command, f"error ({exc})")
+                if denied is not None:
+                    result = adapter.render(req, denied)
+                    return HookResult(exit_code=0, stdout=result.stdout, stderr=stderr + result.stderr)
             except Exception:  # noqa: BLE001, S110 — rendering the denial failed too: the plain error below stays
                 pass
         return HookResult(exit_code=0, stdout="", stderr=stderr)
@@ -179,6 +213,8 @@ def handle(req: HookRequest) -> HookResponse:
         return _offline(req, f"{UNCLEAR_WORKSPACE} ({exc})", None, unclear=True)
     if cfg is None:
         return _offline(req, "not configured", None)
+    if _unreachable_recently(req):  # S20 F-20-99: a hung server costs one timeout per window, not one per tool call
+        return _offline(req, "server unreachable", cfg, window=True)
     client = ApiClient(cfg.server_url, cfg.token, timeout=cfg.request_timeout_seconds)
     try:
         return _HANDLERS[req.event](req, cfg, client)
@@ -192,6 +228,42 @@ def handle(req: HookRequest) -> HookResponse:
         return _offline(req, _offline_label(exc), cfg)
     finally:
         client.close()
+        if client.transport_failed and req.event != "session-end":
+            _remember_unreachable(req)
+
+
+UNREACHABLE_WINDOW = 15.0  # seconds a timed-out call is remembered (S20 F-20-99, D5; a refused connect is not)
+
+
+def _unreachable_recently(req: HookRequest) -> bool:
+    """The session cache says a call to the server timed out less than UNREACHABLE_WINDOW seconds ago (an old mark or
+    one past now + the window is no window). The mark is a file an agent could write (F-20-107, H2-2), so inside the
+    window an edit gets no decision of its own (`_offline`'s `window`) and one on the default branch is refused: the
+    window only saves the wait.
+    SessionEnd always tries (it drops the cache). A missing or odd value, or a clock that went backwards past the
+    window, counts as not recent. Never raises."""
+    if req.event == "session-end":
+        return False
+    try:
+        until = json.loads(_cache_path(req).read_text()).get("unreachable_until")
+        left = float(until) - time.time()
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    return 0 < left <= UNREACHABLE_WINDOW
+
+
+def _remember_unreachable(req: HookRequest) -> None:
+    """Merge `unreachable_until` into the session cache (with no session yet it holds only the mark, as
+    `_wrong_workspace` does). Best effort: never a reason to fail a hook."""
+    path = _cache_path(req)
+    try:
+        cache = json.loads(path.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    cache = cache if isinstance(cache, dict) else {}
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        watcher.write_cache(path, {**cache, "unreachable_until": time.time() + UNREACHABLE_WINDOW})
 
 
 UNCLEAR_WORKSPACE = "no workspace chosen for this clone"
@@ -247,34 +319,76 @@ def _is_offline(exc: Exception) -> bool:
     return isinstance(exc, ServerUnreachable) or (isinstance(exc, ApiError) and exc.status in (401, 429))
 
 
+MEMBERSHIP_ENDED_LABEL = "you are no longer in this workspace"
+
+
 def _offline_label(exc: Exception) -> str:
     if isinstance(exc, ApiError) and exc.status == 429:
         return "token rejected — throttled after too many failed attempts"
     if isinstance(exc, ApiError) and exc.status == 401 and exc.detail == OLD_TOKEN_DETAIL:  # S17 L-31-6: its words
         return exc.detail
+    if isinstance(exc, ApiError) and exc.status == 401 and exc.detail == MEMBERSHIP_ENDED_DETAIL:  # S20 C1c/C1e F13
+        return MEMBERSHIP_ENDED_LABEL
     return "token rejected" if isinstance(exc, ApiError) else "server unreachable"
 
 
-def _offline(req: HookRequest, label: str, cfg: MemberConfig | None, unclear: bool = False) -> HookResponse:
+def _offline(
+    req: HookRequest, label: str, cfg: MemberConfig | None, unclear: bool = False, window: bool = False
+) -> HookResponse:
     """`unclear` (S19): no config was chosen because several workspaces leave the choice open — the person hears
-    `label`, not "not connected"."""
+    `label`, not "not connected". F-20-88 (H1-1): the checks that need no server refuse first, and a risky command is
+    judged by the default and the cached team/strict patterns (as `_fails_closed`). `window` (F-20-109): the answer
+    comes from the cache's unreachable mark, not from a call that failed just now — an edit is not allowed outright
+    (that would skip the member's own permission prompt); it gets no decision, with the same line — and an edit or
+    shell write on the default branch is refused (`_window_default_branch`)."""
+    if req.event == "pre-tool-use" and (refused := _local_refusal(req)) is not None:
+        return refused
     if req.event == "session-start":
         if unclear:
             line = f"Flowmode: {label}; team context unavailable and file claims are not enforced."
             return HookResponse(context=line, stderr=line)
         if cfg is None:
             return HookResponse(context=NOT_CONFIGURED_CONTEXT)
+        if label == MEMBERSHIP_ENDED_LABEL:  # S20 C1e (F13): a membership never comes back by itself
+            line = (
+                f"Flowmode: {token_rejected(cfg, MEMBERSHIP_ENDED_DETAIL)}; team context unavailable and file claims"
+                " are not enforced."
+            )
+            return HookResponse(context=line, notice=line)
         return HookResponse(
             context=f"Flowmode: {label} ({cfg.server_url}); team context unavailable and file"
             " claims are not enforced until it is back."
         )
+    if window and req.event == "pre-tool-use" and (lines := _window_default_branch(req)):
+        return _deny("; ".join(lines))
     hint = NOT_CONNECTED_HINT if cfg is None and not unclear else label
     if req.event == "pre-tool-use" and req.file_paths:
         reason = f"Flowmode: {hint}, claim not recorded"
+        if window:
+            return HookResponse(stderr=reason)
         return HookResponse(decision="allow", reason=reason, stderr=reason)
-    if req.event == "pre-tool-use" and req.command and is_risky(req.command, DEFAULT_RISKY_PATTERNS):
+    if _fails_closed(req):
         return _risky_denied(req.command, hint)
     return HookResponse(stderr=f"Flowmode: {label}")
+
+
+def _window_default_branch(req: HookRequest) -> list[str]:
+    """F-20-109 (re-check 3): inside the unreachable window (a mark an agent could write) an edit or a shell write
+    on the default branch of the cwd's repo is refused as `_claims` refuses it offline — live git decides, no server.
+    The window still skips teammates' claims (a documented limit: the member's own permission prompt runs)."""
+    paths = req.file_paths or [str(p) for p, _ in write_targets(req.command or "", req.cwd)]
+    if not paths:
+        return []
+    here = find_repo(req.cwd)
+    warn = (_read_cache(_cache_path(req)) or {}).get("default_branch_edits") == "warn"
+    lines = []
+    for path in paths:
+        target = find_repo(Path(os.path.normpath(Path(req.cwd) / path)).parent)
+        if not (is_checkout(target) and target.repo == here.repo and target.on_default_branch):
+            continue
+        if (rel := relative_path(target, req.cwd, path)) is not None:
+            lines.append(_unconfirmed_warn_line(target, rel) if warn else on_default_branch_line(target, rel))
+    return lines
 
 
 def _risky_denied(command: str, hint: str) -> HookResponse:
@@ -307,6 +421,18 @@ def _registry_entry(info: RepoInfo) -> dict:
         return {}
 
 
+def _cache_is_live(cached: dict, info: RepoInfo) -> bool:
+    """The cached session matches live git: its `repo` is the cwd's, or the cwd is a plain folder and the cached
+    `root` is a checkout whose live repo is the cached one (an edited cache gains nothing there: the same session
+    stepping into that folder leaves its files unclaimed too)."""
+    if cached.get("repo") == info.repo:
+        return True
+    if is_checkout(info) or not isinstance(root := cached.get("root"), str) or not root:
+        return False
+    home = find_repo(Path(root))
+    return is_checkout(home) and not home.broken and home.repo == cached.get("repo")
+
+
 def ensure_session(
     req: HookRequest,
     cfg: MemberConfig,
@@ -317,11 +443,14 @@ def ensure_session(
 ) -> dict:
     """The cached session for (agent, external_id), registering it on a miss (or always when `force`).
     `where` is the checkout to register (default: the cwd's); `branch` overrides its branch (a detached HEAD keeps
-    the session's branch, S9 §2)."""
+    the session's branch, S9 §2). F-20-109: a cache whose `repo` is not the cwd's (live git) registers again — an
+    edited `repo` would make the session's own files look foreign (no claim, no default-branch refusal).
+    F-20-118: a cwd outside any checkout keeps a session whose cached root is, live, a checkout of the cached repo
+    (the agent stepped into a plain folder; S10 F-10-07 leaves that folder's files unclaimed)."""
     path = _cache_path(req)
-    if not force and where is None and (cached := _read_cache(path)):
-        return cached
     info = where or find_repo(req.cwd)
+    if not force and where is None and (cached := _read_cache(path)) and _cache_is_live(cached, info):
+        return cached
     if info.broken:
         raise BrokenCheckout(info)
     branch = branch if branch is not None else info.branch
@@ -365,6 +494,11 @@ def ensure_session(
     previous = _read_cache(path)  # S12 F-12-03: the session's watcher stays its watcher when the session moves
     if previous and previous.get("session_id") == session["id"] and previous.get("watcher_pid"):
         cache["watcher_pid"] = previous["watcher_pid"]
+    if isinstance(session.get("server_version"), str):  # S20 L-10: the register answer, no extra request
+        cache["server_version"] = session["server_version"]
+    for said in ("update_said", "commit_check_said"):  # a resume does not say them twice
+        if previous and previous.get("session_id") == session["id"] and previous.get(said):
+            cache[said] = True
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cache))
     return cache
@@ -388,8 +522,13 @@ def _remember_mode(req: HookRequest, session: object, forget_hold: bool = False)
 
 
 def _is_stale(exc: ApiError) -> bool:
-    """The cached session id no longer works: server DB reset (404) or ended elsewhere (409 session ended)."""
-    return exc.status == 404 or (exc.status == 409 and exc.detail == "session ended")
+    """The cached session id no longer works: server DB reset (404), ended elsewhere (409 session ended), or not this
+    person's (403 session belongs to …: a cache whose `session_id` was rewritten, F-20-109) — register again."""
+    return (
+        exc.status == 404
+        or (exc.status == 409 and exc.detail == "session ended")
+        or (exc.status == 403 and str(exc.detail).startswith("session belongs to "))
+    )
 
 
 def _with_session(req: HookRequest, cfg: MemberConfig, client: ApiClient, call):
@@ -472,6 +611,15 @@ def on_default_branch_line(info: RepoInfo, rel: str | None = None) -> str:
     )
 
 
+def _unconfirmed_warn_line(info: RepoInfo, rel: str) -> str:
+    """F-20-109: the refusal when the team's `warn` for the default branch could not be confirmed (server gone)."""
+    return (
+        f"Flowmode: server unreachable, so the team's warn for {info.default_branch} (the default branch) cannot be"
+        f" confirmed and the edit of {rel} in {info.root} is refused for now — retry when the server is back, or work"
+        f" on a branch: {WORK_HINT}"
+    )
+
+
 def _start_watcher(req: HookRequest) -> None:
     """S12 F-12-03: leave a detached `flowmode watch` on the agent process, named in the cache as `watcher_pid`; a
     resume replaces the one before. Off with FLOWMODE_NO_WATCHER; skipped without an agent pid. Never an error."""
@@ -527,7 +675,43 @@ def _session_start(req: HookRequest, cfg: MemberConfig, client: ApiClient) -> Ho
     if notes or mode_line:  # after the handoff block, before RULES (the context's last line); the mode right before
         head, _, rules = context.rpartition("\n")
         context = "\n".join([head, *notes, *([mode_line] if mode_line else []), rules])
-    return HookResponse(context=context, stderr="\n".join([*stderr, *note_errors]))
+    notice = "\n".join(filter(None, [_update_notice(req, session), _commit_check_notice(req, session, info)]))
+    return HookResponse(context=context, stderr="\n".join([*stderr, *note_errors]), notice=notice)
+
+
+def _update_notice(req: HookRequest, session: dict) -> str:
+    """S20 L-10: once per session, the line saying the server runs a newer client release. Never raises."""
+    try:
+        from flowmode import __version__
+
+        server = session.get("server_version")
+        if session.get("update_said") or not isinstance(server, str) or not client_outdated(__version__, server):
+            return ""
+        path = _cache_path(req)
+        if (cache := _read_cache(path)) is not None:
+            path.write_text(json.dumps({**cache, "update_said": True}))
+    except Exception:  # noqa: BLE001 — a version hint must never break a session start
+        return ""
+    return f"Flowmode {server} is on the server; you have {__version__}. Run: flowmode update"
+
+
+def _commit_check_notice(req: HookRequest, session: dict, info: RepoInfo) -> str:
+    """S20 F-20-81: once per session, the line saying this checkout's commit-msg check is missing or off (one `git
+    config` read, ~10 ms). Never raises."""
+    try:
+        from flowmode.install import commit_msg_check_off, commit_msg_fix
+
+        if session.get("commit_check_said") or not is_checkout(info):
+            return ""
+        why = commit_msg_check_off(info.root)
+        if why is None:
+            return ""
+        path = _cache_path(req)
+        if (cache := _read_cache(path)) is not None:
+            path.write_text(json.dumps({**cache, "commit_check_said": True}))
+    except Exception:  # noqa: BLE001 — a warning must never break a session start
+        return ""
+    return f"Flowmode: commit-msg check off — {why}. Fix: {commit_msg_fix(why, req.agent)}"
 
 
 def _start_sync(session: dict, info: RepoInfo) -> None:
@@ -642,16 +826,60 @@ def _take_with_session(session: dict, client: ApiClient) -> list[str]:
     return [f"Flowmode: not claimed: {s['detail']}" for s in taken.get("skipped") or []]
 
 
+def _deny(reason: str) -> HookResponse:
+    return HookResponse(decision="deny", reason=reason, stderr=reason)
+
+
+def _local_refusal(req: HookRequest) -> HookResponse | None:
+    """The pre-tool-use refusals that need no server (F-20-88, H1-1: they also run offline, with no member config or
+    an unclear workspace, and after a hook error) — a file tool on the commit-msg hook (S20 F-20-81) or dropping the
+    agent hooks (H1-6); a shell command naming an agent in a commit or PR (L-6 (b)), skipping or switching off the
+    git hooks, storing commit/PR text no check can read (H1-3/H1-4), taking or releasing a task (L-7), or removing
+    the agent hooks (H1-6); a visible write under $FLOWMODE_HOME (F-20-107: hygiene — no cache value can loosen a
+    decision, F-20-109). None for anything else. For a pre-tool-use request."""
+    if req.file_paths:
+        if any(under_flowmode_home(p, req.cwd) for p in req.file_paths):
+            return _deny(FLOWMODE_HOME_REFUSAL)
+        if any(file_edit_tampers(p, req.cwd, req.new_text) for p in req.file_paths):
+            return _deny(HOOKS_GUARD_REFUSAL)
+        if agent_hooks_change(req.tool_name, req.file_input, req.cwd) is not None:
+            return _deny(AGENT_HOOKS_REFUSAL)
+        return None
+    if not req.command:
+        return None
+    if (refused := _attribution(req)) is not None:
+        return refused
+    if takes_or_releases_task(req.command) is not None:
+        return _deny(TASK_HANDS_REFUSAL)
+    if removes_agent_hooks(req.command, req.cwd) is not None:
+        return _deny(AGENT_HOOKS_REFUSAL)
+    if writes_flowmode_home(req.command, req.cwd) is not None:
+        return _deny(FLOWMODE_HOME_REFUSAL)
+    return None
+
+
 def _pre_tool_use(req: HookRequest, cfg: MemberConfig, client: ApiClient) -> HookResponse:
+    # S20 L-6 (b), L-7, F-20-81, F-20-88: the local refusals come before any hold, claim or approval
+    if (refused := _local_refusal(req)) is not None:
+        return refused
     if req.file_paths:
         return _claims(req, cfg, client)
     if req.command:
         _hold(req, client)
         # S11 F-11-37: a shell command that writes to a path is an edit of that path — claimed or refused first
-        written = _shell_writes(req, cfg, client)
+        made: list[tuple[str, str]] = []  # S20 C1a (F6): claims this command created, given back if it never runs
+        written = _shell_writes(req, cfg, client, made)
         if written.decision == "deny":
+            _give_back(client, made)  # one target refused: the targets claimed before it go back too
             return written
-        asked = _approval(req, cfg, client)
+        try:
+            asked = _approval(req, cfg, client)
+        except Exception:
+            if _fails_closed(req):  # run_hook denies a risky command after a hook error: it does not run
+                _give_back(client, made)
+            raise
+        if asked.decision == "deny":
+            _give_back(client, made)  # denied, timed out, or refused offline: the command does not run
         if asked.decision is None and written.decision is not None:
             # not risky: never an "allow" (it would skip the member's own permission prompt for the whole command,
             # code review of the P0 group); the claim's warnings go to stderr
@@ -662,6 +890,41 @@ def _pre_tool_use(req: HookRequest, cfg: MemberConfig, client: ApiClient) -> Hoo
     if req.mcp_tool == "release":
         return _release_guard(req)
     return HookResponse()
+
+
+def _attribution(req: HookRequest) -> HookResponse | None:
+    """S20 L-6 (b), §4.3: a commit or pull-request command that would name an agent as author or co-author is denied,
+    naming what to remove; so is a `git commit`/`merge`/`pull` that would skip the git hooks (`--no-verify`, `-n`,
+    `-c core.hooksPath=…`), and (F-20-81, before the scope gate) any command that would switch the commit-msg check
+    off. Commit message files are read inside the checkout, PR text and plumbing files anywhere, and commit or PR text
+    no check can read is refused (F-20-88, H1-3/H1-4). A failure of the check itself is no answer (the command goes on
+    to the usual checks), never a crash of the hook."""
+    cwd = Path(req.cwd)
+    tampered = tampers_with_git_hooks(req.command, cwd)  # never raises
+    found: list[str] = []
+    skipped = unchecked = None
+    try:
+        if attribution_scope(req.command):
+            info = find_repo(cwd)
+            found = attribution_findings(req.command, cwd, info.root if is_checkout(info) else cwd)
+            skipped = skips_git_hooks(req.command)
+            unchecked = unchecked_commit_text(req.command, cwd)  # F-20-88 (H1-3/H1-4), never raises
+    except Exception:  # noqa: BLE001, S110 — never a broken hook; the commit-msg check is the last line (SR-5)
+        pass
+    if not found and skipped is None and tampered is None and unchecked is None:
+        return None
+    reason = "\n".join(
+        filter(
+            None,
+            [
+                attribution_refusal(found) if found else "",
+                HOOKS_ON_REFUSAL if skipped else "",
+                HOOKS_GUARD_REFUSAL if tampered else "",
+                UNCHECKED_REFUSAL.format(why=unchecked) if unchecked else "",
+            ],
+        )
+    )
+    return HookResponse(decision="deny", reason=reason, stderr=reason)
 
 
 def _hold(req: HookRequest, client: ApiClient) -> None:
@@ -725,6 +988,78 @@ def _release_guard(req: HookRequest) -> HookResponse:
     return HookResponse()
 
 
+def _server_says_warn(client: ApiClient) -> bool | None:
+    """S11 F-11-32 / F-20-109: the team lets edits on the default branch through with a warning — asked of the
+    server (GET /config), because the cache's `default_branch_edits` is a file an agent could write. None when the
+    server cannot be reached (or the token is rejected), False on any other error: either way the edit is refused."""
+    try:
+        return client.config().get("default_branch_edits") == "warn"
+    except ServerUnreachable:
+        return None
+    except ApiError as exc:
+        return None if _is_offline(exc) else False
+    except AttributeError:
+        return False
+
+
+def _text_list(value: object) -> list[str] | None:
+    return [p for p in value if isinstance(p, str)] if isinstance(value, list) else None
+
+
+def _session_patterns(session: dict) -> tuple[str, list[str]]:
+    """S8 §6: (mode, risky patterns) as the cached session holds them (a mode outside MODES is `normal`, a list that
+    is not a list falls back to the built-in patterns)."""
+    mode = session.get("mode") if session.get("mode") in MODES else "normal"
+    team = _text_list(session.get("risky_patterns", DEFAULT_RISKY_PATTERNS))
+    return mode, patterns_for(mode, DEFAULT_RISKY_PATTERNS if team is None else team)
+
+
+def _strictest_team(session: dict) -> list[str]:
+    """F-20-109 (H2-1): the cache can only add — the built-in patterns plus its text entries."""
+    team = _text_list(session.get("risky_patterns")) or []
+    return [*DEFAULT_RISKY_PATTERNS, *(p for p in team if p not in DEFAULT_RISKY_PATTERNS)]
+
+
+def _strictest_patterns(session: dict) -> tuple[str, list[str]]:
+    """F-20-109 (H2-1): what a cache an agent edited could still make the hook ask — `strict` from the cache counts
+    (it asks more), anything else is `normal`; the patterns are `_strictest_team`."""
+    mode = "strict" if session.get("mode") == "strict" else "normal"
+    return mode, patterns_for(mode, _strictest_team(session))
+
+
+def _own_live_session(req: HookRequest, answer: object) -> bool:
+    """F-20-109 (re-check 3): a GET /sessions/{id} answer is this hook's own session only when its agent and external
+    id are the hook input's (not the cache's) and it has not ended — any member may read any session of the
+    workspace, so a cached `session_id` could name a teammate's (or the person's other) relaxed session."""
+    return (
+        isinstance(answer, dict)
+        and answer.get("agent") == req.agent
+        and answer.get("external_id") == req.external_id
+        and not answer.get("ended_at")
+    )
+
+
+def _confirmed_patterns(req: HookRequest, session: dict, client: ApiClient) -> tuple[str, list[str]] | None:
+    """F-20-109: (mode, patterns) from the server for a command the cache would let through but the strictest local
+    view asks about — the team's list (GET /config) when the cache dropped a built-in pattern, the session's mode
+    (GET /sessions/{id}) when the cache says `relaxed` and the answer is this hook's own live session
+    (`_own_live_session`; any other session leaves the mode strict); the part not asked stays at its strictest.
+    None when the server cannot be asked (unreachable, an error, an odd answer): the command is asked."""
+    mode, team = _strictest_patterns(session)[0], _strictest_team(session)
+    try:
+        if session.get("mode") == "relaxed":
+            answer = client.get_session(session["session_id"])
+            live = answer.get("mode") if _own_live_session(req, answer) else None
+            mode = live if live in MODES else mode
+        if not set(DEFAULT_RISKY_PATTERNS) <= set(_text_list(session.get("risky_patterns")) or []):
+            team = _text_list(client.config().get("risky_patterns"))
+            if team is None:
+                return None
+    except (ServerUnreachable, ApiError, AttributeError, KeyError):
+        return None
+    return mode, patterns_for(mode, team)
+
+
 def _approval(req: HookRequest, cfg: MemberConfig, client: ApiClient) -> HookResponse:
     """§5.5: risky commands wait for a teammate's decision; unreachable / rejected / timed out → deny."""
     cmd = req.command[:120]
@@ -734,10 +1069,14 @@ def _approval(req: HookRequest, cfg: MemberConfig, client: ApiClient) -> HookRes
         if not _is_offline(exc):
             raise
         return _offline(req, _offline_label(exc), cfg)
-    mode = session.get("mode") or "normal"
-    patterns = patterns_for(mode, session.get("risky_patterns", DEFAULT_RISKY_PATTERNS))
-    if is_risky(req.command, patterns) is None:
+    if is_risky(req.command, _strictest_patterns(session)[1]) is None:
         return HookResponse()
+    mode, patterns = _session_patterns(session)
+    if is_risky(req.command, patterns) is None:  # F-20-109: the cache would let it through — only the server may
+        confirmed = _confirmed_patterns(req, session, client)
+        if confirmed is not None and is_risky(req.command, confirmed[1]) is None:
+            return HookResponse()
+        mode, patterns = confirmed or _strictest_patterns(session)
     # S14 F-14-05: the secrets stay on this machine; the raw command stays in `last_approval`, so the outcome report
     # still finds it
     shown = redact_secrets(req.command)
@@ -795,19 +1134,31 @@ def _approval(req: HookRequest, cfg: MemberConfig, client: ApiClient) -> HookRes
     return HookResponse(decision="deny", reason=f"Flowmode: '{cmd}' timed out after {timeout}s without a decision")
 
 
-def _shell_writes(req: HookRequest, cfg: MemberConfig, client: ApiClient) -> HookResponse:
+def _shell_writes(
+    req: HookRequest, cfg: MemberConfig, client: ApiClient, made: list[tuple[str, str]] | None = None
+) -> HookResponse:
     """S11 F-11-37: the command's write targets go through the claim path; offline, the edit is allowed with the
-    S2 "claim not recorded" word and the risky check that follows keeps its own offline answer."""
+    S2 "claim not recorded" word and the risky check that follows keeps its own offline answer. `made` (S20 C1a)
+    collects (session id, path) of each claim this command created."""
     paths = [str(p) for p, _ in write_targets(req.command or "", req.cwd)]
     if not paths:
         return HookResponse()
     try:
-        return _claims(req, cfg, client, paths=paths)
+        return _claims(req, cfg, client, paths=paths, made=made)
     except (ServerUnreachable, ApiError) as exc:
         if not _is_offline(exc):
             raise
         reason = f"Flowmode: {_offline_label(exc)}, claim not recorded"
         return HookResponse(decision="allow", reason=reason, stderr=reason)
+
+
+def _give_back(client: ApiClient, made: list[tuple[str, str]]) -> None:
+    """S20 C1a (walkthrough F6): release the claims a shell command created when it will not run (denied, timed out,
+    refused). Only claims this command created: one the session already held stays. Best effort — a failure leaves
+    the claim to expire with its ttl."""
+    for session_id, path in made:
+        with contextlib.suppress(ApiError, ServerUnreachable):
+            client.release_claim(session_id, path)
 
 
 # --- S11 F-11-30: the outcome of an approved command ---------------------------------------------------------
@@ -901,9 +1252,29 @@ def _report_outcome(req: HookRequest, client: ApiClient) -> list[str]:
     ]
 
 
-def _claims(req: HookRequest, cfg: MemberConfig, client: ApiClient, paths: list[str] | None = None) -> HookResponse:
-    """Claim every path (the tool's `file_paths`, or `paths`: the S11 F-11-37 shell targets, absolute)."""
+def _claims(
+    req: HookRequest,
+    cfg: MemberConfig,
+    client: ApiClient,
+    paths: list[str] | None = None,
+    made: list[tuple[str, str]] | None = None,
+) -> HookResponse:
+    """Claim every path (the tool's `file_paths`, or `paths`: the S11 F-11-37 shell targets, absolute). `made` (S20
+    C1a) gets (session id, path) of each claim the server created (not one it refreshed)."""
     denied, warnings, notes = [], [], []
+    said_warn: list[bool | None] = []  # F-20-109: the server's word on `warn`, asked once per hook, only when needed
+
+    def warns(session: dict) -> bool | None:
+        """True: warn; False: refuse; None: refuse, the server could not confirm the cache's `warn`."""
+        if session.get("default_branch_edits") != "warn":  # the cache can only make it stricter
+            return False
+        if not said_warn:
+            said_warn.append(_server_says_warn(client))
+        return said_warn[0]
+
+    def refused(info: RepoInfo, rel: str, warn: bool | None) -> str:
+        return _unconfirmed_warn_line(info, rel) if warn is None else on_default_branch_line(info, rel)
+
     for path in req.file_paths if paths is None else paths:
         full = Path(os.path.normpath(Path(req.cwd) / path))
         target = find_repo(full.parent)
@@ -914,27 +1285,31 @@ def _claims(req: HookRequest, cfg: MemberConfig, client: ApiClient, paths: list[
             is_checkout(target)
             and target.repo == session.get("repo")
             and target.on_default_branch
-            and session.get("default_branch_edits", "deny") != "warn"
+            and not (warn := warns(session))
         ):
             # S11 F-11-32: refused before the session follows the edit — a refused edit never moves a session
             # out of its task worktree (code review of the P0 group)
             rel = relative_path(target, req.cwd, path)
             if rel is not None:
-                denied.append(on_default_branch_line(target, rel))
+                denied.append(refused(target, rel, warn))
                 continue
         session, info = _follow_edit(req, cfg, client, session, path)
         rel = relative_path(info, req.cwd, path) if info is not None else None
         if rel is None:
             continue
         if info is not None and info.on_default_branch:  # S11 F-11-32: no work on the default branch
-            line = on_default_branch_line(info, rel)
-            if session.get("default_branch_edits", "deny") == "warn":
-                warnings.append(line)
+            if warn := warns(session):
+                warnings.append(on_default_branch_line(info, rel))
             else:
-                denied.append(line)
+                denied.append(refused(info, rel, warn))
                 continue
         try:
-            _, body = _with_session(req, cfg, client, lambda s: client.claim(s["session_id"], rel))  # noqa: B023 — runs now
+            sid, (_, body) = _with_session(
+                req,
+                cfg,
+                client,
+                lambda s: (s["session_id"], client.claim(s["session_id"], rel)),  # noqa: B023 — runs now
+            )
         except ApiError as exc:
             if exc.status == 409:
                 denied.append(f"Flowmode: {exc.detail}")
@@ -950,6 +1325,8 @@ def _claims(req: HookRequest, cfg: MemberConfig, client: ApiClient, paths: list[
             break
         else:
             warnings.extend(f"Flowmode: {w}" for w in body.get("warnings") or [])
+            if made is not None and body.get("created"):
+                made.append((sid, rel))
     stderr = "\n".join(notes)
     if denied:
         return HookResponse(decision="deny", reason="; ".join(denied), stderr=stderr)
@@ -965,8 +1342,17 @@ def _activity(req: HookRequest) -> str | None:
         rel = relative_path(find_repo(req.cwd), req.cwd, req.file_paths[0])
         return f"{req.tool_name} {rel or Path(req.file_paths[0]).name}"
     if req.command:
-        return f"{req.tool_name} {req.command[:80]}"
+        return f"{req.tool_name} {_local_paths_hidden(req.command, req.cwd)[:80]}"
     return req.tool_name
+
+
+def _local_paths_hidden(command: str, cwd: Path) -> str:
+    """F-20-107 (from R2-streams): the command head a heartbeat carries, with the working folder written `.` and the
+    home folder `~` — no absolute path of this machine leaves it (the server cuts them too)."""
+    for name, short in ((str(cwd), "."), (os.path.expanduser("~"), "~")):
+        if folder := name.rstrip("/"):
+            command = re.sub(re.escape(folder) + r"(?![^/\s'\";|&)<>])", short, command)
+    return command
 
 
 def _post_tool_use(req: HookRequest, cfg: MemberConfig, client: ApiClient) -> HookResponse:
@@ -978,12 +1364,14 @@ def _post_tool_use(req: HookRequest, cfg: MemberConfig, client: ApiClient) -> Ho
     )
     _remember_mode(req, answer, forget_hold=True)  # the claims are back on the normal ttl: the next hold goes out
     session = ensure_session(req, cfg, client)
-    notes, errors = _deliver_notes(session, client, best_effort=True)
+    taken: list[str] = []
+    notes, errors = _deliver_notes(session, client, best_effort=True, taken=taken)
     if req.mcp_tool == "handoff" and not req.tool_failed:
         notes = [*notes, *_handoff_push_hints(session)]
     if req.command:
         notes = [*notes, *_report_outcome(req, client)]  # S11 F-11-30
-    return HookResponse(context="\n".join(notes), stderr="\n".join(errors))
+    # S20 C1e: a task taken from this session's person is said to the person too (Claude: systemMessage, Codex: stderr)
+    return HookResponse(context="\n".join(notes), stderr="\n".join(errors), notice="\n".join(taken))
 
 
 def _record_read(req: HookRequest, client: ApiClient) -> None:
@@ -1029,11 +1417,14 @@ def _handoff_push_hints(session: dict) -> list[str]:
     return [f"Flowmode: {text}" for _, text in hints]
 
 
-def _deliver_notes(session: dict, client: ApiClient, best_effort: bool = False) -> tuple[list[str], list[str]]:
+def _deliver_notes(
+    session: dict, client: ApiClient, best_effort: bool = False, taken: list[str] | None = None
+) -> tuple[list[str], list[str]]:
     """S7 §9: the member's own unread notes for this session, oldest first, at most 10, then marked read.
     Only notes (from == to == the member): nothing another member wrote is ever delivered by a hook. Any failure of
     the lookup delivers nothing (no stale-session retry); a failed mark-read only leaves a stderr line — the notes
     come again next time, never lost. `best_effort`: the lookup uses the short timeout (post-tool-use, S10).
+    `taken` (S20 C1e) gets the terminal-safe text of each delivered "task was taken" note the server left.
     Returns (context lines, stderr lines)."""
     try:
         unread = client.list_messages(unread=True, session_id=session["session_id"], best_effort=best_effort)
@@ -1046,6 +1437,8 @@ def _deliver_notes(session: dict, client: ApiClient, best_effort: bool = False) 
     ][:MAX_NOTES_PER_DELIVERY]
     if not notes:
         return [], []
+    if taken is not None:
+        taken.extend(terminal_safe(n.get("text"), 400) for n in notes if TAKEN_NOTE_RE.match(str(n.get("text", ""))))
     lines = [f"Notes from {notes[0]['to_member']} ({len(notes)}):"]
     for note in notes:
         lines.append(f"- {_hhmm(note.get('created_at'))}")
@@ -1127,7 +1520,7 @@ def team_context(req: HookRequest, session: dict, client: ApiClient) -> str:
     me = client.me().get("name", "?")
     sessions = [s for s in client.list_sessions(repo=repo, status="active") if s.get("id") != own]
     claims = [c for c in client.list_claims(repo=repo) if c.get("session_id") != own]
-    plans = [p for p in client.list_plans(repo=repo) if p.get("session_id") != own]
+    plans = [p for p in client.list_plans(repo=repo, latest=True) if p.get("session_id") != own]
     decisions = [d for d in client.list_decisions(repo=repo) if d.get("session_id") != own]
     approvals = [a for a in client.list_approvals(status="pending", repo=repo) if a.get("session_id") != own]
     branches = {s.get("id"): s.get("branch") for s in sessions}

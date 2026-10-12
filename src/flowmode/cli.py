@@ -212,6 +212,19 @@ Common errors:
   not configured                                  run flowmode login --server <url> first
 """,
     ),
+    "update": (
+        """\
+Install the client release the team server runs (the public client repo at the tag v<version>), then
+re-run install for the agents that already have Flowmode hooks in this repo. The command is printed before it runs; off a terminal
+it needs --yes.""",
+        """Examples:
+  flowmode update                                 show the command and ask
+  flowmode update --yes                           run it without asking
+
+Common errors:
+  could not read the server's version             the server is down, or it did not answer with a version
+""",
+    ),
     "hook": (
         """\
 Handle one agent hook event: read the hook's JSON on stdin, talk to the team server (claims,
@@ -256,14 +269,18 @@ Common errors:
         """\
 Take a handoff: check out its branch in a new worktree next to the main checkout, copy the
 agent config into it, and mark the handoff taken (its task becomes yours). The target is the
-task name or the handoff id.""",
+task name or the handoff id. A task released to the team (no handoff for you under that name,
+or its tsk_… id) is taken on its page in the browser: the server refuses a device token, so
+this prints the task's page and exits 1.""",
         """Examples:
   flowmode task take login-fix                    the pending handoff of task login-fix in this repository
   flowmode task take hof_…                        by handoff id
+  flowmode task take tsk_…                        a released task, by id (prints its page)
 
 Common errors:
   no pending handoff for task '<name>' in <repo>  nothing handed off under that name: flowmode task list
   handoff <id> is addressed to <member>           only that member (or anyone, for an unassigned one) takes it
+  this task was released — take it on the site    not a handoff: open the printed page and press Take
   branch '<b>' is not in this clone               git fetch origin <b>, or ask the sender to push it
   <path> already exists                           a directory is in the way: remove it or pass --path
 """,
@@ -295,6 +312,7 @@ assigned that were declined, with the reason.""",
 Common errors:
   not configured                                  run flowmode login --server <url> first
   token rejected by <server>                      a revoked device: run flowmode login again
+  you are no longer in workspace <name>           ask a leader for a new invitation, then flowmode login
 """,
     ),
     "task decline": (
@@ -337,6 +355,21 @@ Common errors:
   only <assigner> or <owner> can cancel …         ask one of them
   only <assigner> can cancel a <status> task      as its owner, decline it instead
   task is done                                    finished tasks stay as they are
+""",
+    ),
+    "task release": (
+        """\
+Give a task back to the team: it stays yours (its owner) until any member takes it. Its owner or
+a leader of the workspace releases it, on the task's page in the browser: the server refuses a
+device token, so this prints the task's page and exits 1. A done task cannot be released.""",
+        """Examples:
+  flowmode task release login-fix --note "away until Monday"
+  flowmode task release tsk_…                     by id, from any directory
+
+Common errors:
+  only the task's owner or a leader may release it   ask its owner or a leader
+  task is done                                       finished tasks stay as they are
+  task is already released                           it waits for a taker: flowmode task list
 """,
     ),
     "task done": (
@@ -548,6 +581,13 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument("agent", choices=INSTALLABLE_AGENTS)
     install.add_argument("--repo", default=".", help="repository directory (default: current directory)")
     install.add_argument("--force", action="store_true", help="replace Flowmode skills that were edited locally")
+    update = commands.add_parser(
+        "update", help="install the client release the server runs, then re-install the hooks here", **_more("update")
+    )
+    update.add_argument("--yes", action="store_true", help="run without asking (needed when not on a terminal)")
+    update.add_argument(
+        "--allow-downgrade", action="store_true", help="install the server's version even when it is older than this"
+    )
     hook = commands.add_parser(
         "hook", help="handle one agent hook event (reads the hook JSON on stdin)", **_more("hook")
     )
@@ -584,7 +624,7 @@ def _parser() -> argparse.ArgumentParser:
     take = task_cmds.add_parser(
         "take", help="check out a handed-off branch in a new worktree and take the handoff", **_more("task take")
     )
-    take.add_argument("target", help="task name or handoff id (hof_…)")
+    take.add_argument("target", help="task name, handoff id (hof_…) or released task id (tsk_…)")
     take.add_argument("--path", help="worktree directory (default: <repo>-worktrees/<name> next to the checkout)")
     take.add_argument("--repo", default=".", help="any directory inside the checkout (default: current directory)")
     _task_assignment_parsers(task_cmds)
@@ -625,6 +665,13 @@ def _parser() -> argparse.ArgumentParser:
         epilog=CHECK_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    check.add_argument(
+        "mode",
+        nargs="?",
+        choices=["commit-msg"],
+        help="commit-msg <file>: the git hook's check — the message and author/committer name no agent (S20)",
+    )
+    check.add_argument("file", nargs="?", help=argparse.SUPPRESS)
     check.add_argument(
         "--repo", default=".", help="any directory inside the task worktree (default: current directory)"
     )
@@ -730,6 +777,7 @@ def _task_assignment_parsers(task_cmds) -> None:
         ("resend", "send a declined task again, or to someone else"),
         ("cancel", "cancel a task"),
         ("done", "mark a task done (its owner or its assigner)"),
+        ("release", "give a task back to the team (its owner or a leader); any member takes it"),
         ("delete", "delete a task for everyone (asks first)"),
     ):
         fuller = {
@@ -745,6 +793,8 @@ def _task_assignment_parsers(task_cmds) -> None:
             sub.add_argument("--reason", help="why (the assigner sees it)")
         if command == "resend":
             sub.add_argument("--to", help="member name (default: the same member again)")
+        if command == "release":
+            sub.add_argument("--note", help="why, for the team (rides the release event)")
         if command == "done":
             # S12 F-12-14: done never closes the issue; both options stay (the S7 parser pins), ignored with a note
             sub.add_argument("--comment", help="ignored since S12 (the merge of the pull request closes the issue)")
@@ -810,15 +860,14 @@ def _env_override_warning(cfg) -> str | None:
 
 
 def _terminal_safe(text: object) -> str:
-    """S14 F-14-13 criterion 7: a server's string as it may reach the terminal — no control character (ESC, BEL,
-    CSI, …) and no invisible format character."""
-    from flowmode.refs import display_safe
+    """S14 F-14-13 criterion 7: a server's string as it may reach the terminal (`refs.terminal_safe`, S20 F-20-90)."""
+    from flowmode.refs import terminal_safe
 
-    return display_safe(str(text))
+    return terminal_safe(text)
 
 
 LOGIN_HINT = (
-    'Shells or tools that exported the old token still use it: run eval "$(flowmode env)" there again,'
+    'If a shell or tool exported an older token, it still uses that one: run eval "$(flowmode env)" there again,'
     " or open a new terminal."
 )
 LOGIN_INTERVAL_MAX = 600
@@ -1127,6 +1176,212 @@ def _env(args: argparse.Namespace) -> int:
     return 0
 
 
+CLIENT_REPO_URL = (
+    "https://github.com/msgenan/flowmode-cli"  # the public client repo (the export allowlist has no config.py)
+)
+
+
+class _NotPrivate(Exception):
+    """The update's source folder is not the member's own private folder (U-2)."""
+
+
+def _private_source(version: str):
+    """S20 F-20-90 (red team U-2): `$FLOWMODE_HOME/client-src/v<version>`, made for this run. uv's tool record names
+    the folder it built from and a later `uv tool upgrade` rebuilds from it, so it must outlive the run and be the
+    member's own: `client-src` is a real folder (no symlink) of this user, mode 0700, in a FLOWMODE_HOME of this user
+    that nobody else may write; a leftover of the same version is removed first (git clones into a new folder)."""
+    import contextlib
+    import os
+    import stat
+
+    from flowmode.shared import flowmode_home
+
+    home = flowmode_home()
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    base = home / "client-src"
+    with contextlib.suppress(FileExistsError):  # an existing one is checked below
+        base.mkdir(mode=0o700)
+    for folder, closed, rule in ((home, 0o022, "no write for group or others"), (base, 0o077, "mode 0700")):
+        info = os.lstat(folder)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & closed:
+            raise _NotPrivate(
+                f"{folder} must be a folder of yours that nobody else can change (not a symbolic link, {rule});"
+                f" fix or remove it and run flowmode update again"
+            )
+    target = base / f"v{version}"
+    _remove(target)
+    return target
+
+
+def _remove(path) -> None:
+    """Remove one entry of the private source folder: a symbolic link itself, never what it points to."""
+    import shutil
+
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _update(args: argparse.Namespace) -> int:
+    """S20 L-10, SR-8: install the client release whose tag is the server's version, then re-install for this repo.
+    F-20-90 (red team r1): the source stays in a private folder (U-2), a downgrade needs --allow-downgrade (U-4), the
+    plan reaches a pipe before anything runs (U-5), only a git checkout is re-installed (U-6)."""
+    import os
+    import re
+    import shlex
+    import tempfile
+
+    from flowmode.api_client import ApiClient, ApiError, ServerUnreachable
+    from flowmode.member_config import load_member_config
+
+    cfg = load_member_config()
+    if cfg is None:
+        print("error: Not configured (run flowmode login --server <url>)", file=sys.stderr)
+        return 1
+    try:
+        answer = ApiClient(cfg.server_url, None).health()  # unauthenticated: no token sent
+    except (ServerUnreachable, ApiError) as exc:
+        print(f"error: could not read the server's version: {_terminal_safe(exc)}", file=sys.stderr)
+        return 1
+    version = answer.get("version") if isinstance(answer, dict) else None  # R2 U2-3: a list or text is no answer
+    # fullmatch: `$` takes a "\n"; ASCII digits, bounded, so int() never meets thousands of digits (U2-3)
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}", version):
+        print("error: the server did not give a plain X.Y.Z version; nothing was run", file=sys.stderr)
+        return 1
+    if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", __version__) and _parts(version) == _parts(__version__):  # "0.20.00" too
+        print(f"Flowmode {__version__} is up to date.")
+        return 0
+    verb = "Updating"
+    if re.fullmatch(r"\d+\.\d+\.\d+", __version__) and _parts(version) < _parts(__version__):  # U-4
+        if not getattr(args, "allow_downgrade", False):
+            print(
+                f"error: the server runs {version}, older than this client {__version__}: nothing was run; to"
+                f" install {version} anyway run flowmode update --allow-downgrade",
+                file=sys.stderr,
+            )
+            return 1
+        verb = "Downgrading"
+    src = None
+    with tempfile.TemporaryDirectory(prefix="flowmode-update-") as work:  # only the pins file: removed afterwards
+        pins = f"{work}/pins.txt"
+        if template := os.environ.get("FLOWMODE_UPDATE_CMD"):  # the test seam: one argv line instead of the steps
+            steps = [[part.replace("{version}", version) for part in shlex.split(template)]]
+        else:  # clone the tag, then setup.sh's pinned install line (client/setup.sh:109-112)
+            try:
+                src = _private_source(version)
+            except (_NotPrivate, OSError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            steps = [
+                ["git", "clone", "--depth", "1", "--branch", f"v{version}", CLIENT_REPO_URL, str(src)],
+                [
+                    "uv",
+                    "export",
+                    "--frozen",
+                    "--no-dev",
+                    "--no-emit-project",
+                    "--no-hashes",
+                    "--no-header",
+                    "--quiet",
+                    "--project",
+                    str(src),
+                    "-o",
+                    pins,
+                ],
+                ["uv", "tool", "install", "--force", "--reinstall", "--constraints", pins, str(src)],
+            ]
+        print(f"{verb} {__version__} -> {version}. Commands:")
+        for argv in steps:
+            print(f"  {shlex.join(argv)}")
+        sys.stdout.flush()  # U-5: off a terminal stdout is block-buffered; the plan must be out before a child runs
+        if not args.yes and not sys.stdin.isatty():
+            print("error: not a terminal: nothing was run; add --yes to run it", file=sys.stderr)
+            return 1
+        if not args.yes:
+            try:
+                answer = input("Run them? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\nCancelled: nothing was run.")
+                return 1
+            if answer not in ("y", "yes"):
+                print("Nothing was run.")
+                return 1
+        code = _run_steps(steps, version)
+        if code:
+            if src is not None:
+                _remove(src)  # the half-made folder; the version uv still points at stays
+            return code
+    if src is not None:  # installed from `src`: the older versions' folders are no longer named by uv
+        for old in src.parent.iterdir():
+            if old.name != src.name and re.fullmatch(r"v\d+\.\d+\.\d+", old.name):
+                _remove(old)
+    code = _reinstall_here()
+    if code == 0:
+        print(f"Updated to {version}. Restart your agent sessions to use it.")
+    return code
+
+
+def _parts(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def _run_steps(steps: list[list[str]], version: str) -> int:
+    """Run the update's commands in order; the first failure's exit code (0 when all ran)."""
+    import subprocess
+
+    for number, argv in enumerate(steps):
+        try:
+            done = subprocess.run(argv, check=False)
+        except OSError as exc:
+            print(f"error: could not run {argv[0]}: {exc}", file=sys.stderr)
+            return 1
+        if done.returncode != 0:
+            missing = f" (is the tag v{version} published in {CLIENT_REPO_URL}?)" if argv[0] == "git" else ""
+            print(f"error: step {number + 1} failed ({done.returncode}){missing}", file=sys.stderr)
+            return done.returncode
+    return 0
+
+
+def _reinstall_here() -> int:
+    """Re-install the agents that have Flowmode hooks in the git checkout the update runs in; outside a checkout (e.g.
+    HOME with user-level hooks) nothing (U-6: `install` there would write user-wide skills and `.mcp.json`)."""
+    import subprocess
+    from pathlib import Path
+
+    from flowmode.doctor import _has_flowmode_hook, _json
+    from flowmode.repo import find_repo, is_checkout
+
+    info = find_repo(Path.cwd())
+    if not is_checkout(info):
+        print(
+            f"{info.root} is not a git checkout: nothing re-installed here. In each repository that uses Flowmode run"
+            " flowmode install claude (or codex) there."
+        )
+        return 0
+    root = info.root
+    servers = _json(root / ".mcp.json").get("mcpServers")  # a member may have cut the hooks out: the MCP entry stays
+    claude = _has_flowmode_hook(root / ".claude/settings.json") or (
+        isinstance(servers, dict) and isinstance(servers.get("flowmode"), dict)
+    )
+    hooked = [
+        a for a, found in (("claude", claude), ("codex", _has_flowmode_hook(root / ".codex/hooks.json"))) if found
+    ]
+    if not hooked:
+        print(
+            f"No Flowmode hooks in {root}: nothing to re-install here (run flowmode install <agent> when you want them)."
+        )
+        return 0
+    sys.stdout.flush()
+    for agent in hooked:  # the NEW client does it: this process still holds the old modules in memory
+        code = subprocess.run(
+            [sys.executable, "-P", "-m", "flowmode", "install", agent, "--repo", str(root)], check=False
+        )
+        if code.returncode:
+            return code.returncode
+    return 0
+
+
 def _install(args: argparse.Namespace) -> int:
     from pathlib import Path
 
@@ -1214,8 +1469,8 @@ def _chat(args: argparse.Namespace) -> int:
             raise Failed("text must not be empty")
         with _client(cfg) as client:
             chat = client.post_chat(args.text)
-        print(f"chat: {chat['id']}")
-        print(f"mentions: {', '.join(chat['mentions']) or '-'}")
+        print(f"chat: {_terminal_safe(chat['id'])}")  # S20 F-20-90: server text through the one filter
+        print(f"mentions: {_terminal_safe(', '.join(chat['mentions'])) or '-'}")
 
     return _run(post, args)
 
@@ -1230,6 +1485,85 @@ def _closing_url(task: dict | None, origin: str | None) -> str | None:
     if not issue.get("url") or not _same_github_repo(github_repo_of(origin), str(issue.get("repo") or "")):
         return None
     return issue["url"]
+
+
+def _git_ident(var: str) -> str | None:
+    """`git var GIT_AUTHOR_IDENT` / `GIT_COMMITTER_IDENT` in the current directory, without the date; None when git
+    has no identity (or no git): that is not a finding."""
+    import subprocess
+
+    try:
+        out = subprocess.run(["git", "var", var], capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    ident = out.stdout.strip()
+    end = ident.rfind(">")
+    return ident[: end + 1] if end >= 0 else ident
+
+
+def _git_comment() -> str | None:
+    """The comment string git strips (core.commentString, else core.commentChar; default `#`); None for `auto`."""
+    import subprocess
+
+    for key in ("core.commentString", "core.commentChar"):
+        try:
+            out = subprocess.run(
+                ["git", "config", "--get", key], capture_output=True, text=True, timeout=10, check=False
+            )
+        except (OSError, subprocess.SubprocessError):
+            return "#"
+        value = out.stdout.rstrip("\n")
+        if out.returncode == 0 and value:
+            return None if value == "auto" else value
+    return "#"
+
+
+def _git_cleanup() -> str | None:
+    """commit.cleanup (None when unset or unreadable): which lines git strips from an edited message."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "config", "--get", "commit.cleanup"], capture_output=True, text=True, timeout=10, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (out.stdout.strip() or None) if out.returncode == 0 else None
+
+
+def _check_commit_msg(file: str | None) -> int:
+    """S20 L-6 (c), §4.3: the git commit-msg hook's check — exit 1 with one line per agent marker in the message git
+    may store (comment lines and `git commit -v`'s diff skipped only where git strips them, F-20-88) or agent
+    author/committer git will store; 0 when clean."""
+    from flowmode.risky import commit_msg_findings
+
+    if not file:
+        print("error: flowmode check commit-msg <file>: the commit message file is missing", file=sys.stderr)
+        return 2
+    try:
+        with open(file, "rb") as f:
+            message = f.read(1024 * 1024).decode("utf-8", errors="replace")
+    except OSError as exc:
+        print(f"error: cannot read {file}: {exc.strerror or exc}", file=sys.stderr)
+        return 1
+    idents = [
+        (role, ident)
+        for role, var in (("author", "GIT_AUTHOR_IDENT"), ("committer", "GIT_COMMITTER_IDENT"))
+        if (ident := _git_ident(var)) is not None
+    ]
+    import os
+
+    # F-20-88 (H1-2): git sets GIT_EDITOR=: for the hook when no editor ran (`-m`, `-F`, `--no-edit`)
+    editor = os.environ.get("GIT_EDITOR") != ":"
+    found = commit_msg_findings(message, idents, _git_comment(), editor=editor, cleanup=_git_cleanup())
+    for item in found:
+        print(
+            f'flowmode: remove "{item}" — commits in this team never name an agent as author or co-author',
+            file=sys.stderr,
+        )
+    return 1 if found else 0
 
 
 def _check(args: argparse.Namespace) -> int:
@@ -1303,7 +1637,10 @@ def _check(args: argparse.Namespace) -> int:
         for row in shown:
             if row["kind"] != "command":
                 person_open = row["kind"] == "person" and row["status"] == "open"
-                print(f"check: {row['name']} · {'person' if person_open else row['status']}")
+                status = "person" if person_open else _terminal_safe(row["status"])
+                print(
+                    f"check: {_terminal_safe(row['name'])} · {status}"
+                )  # S20 F-20-90: the stored rows are the server's
         _conflicts(root)
         for line in pr_lines:  # S12 F-12-10: the pull request as the member's gh sees it
             print(line)
@@ -1314,7 +1651,7 @@ def _check(args: argparse.Namespace) -> int:
         elif task is None:
             print("not stored: no task for this worktree (flowmode work <task> opens one)", file=sys.stderr)
         elif body:
-            print(f"stored on task {task['name']} ({task['id']})")
+            print(f"stored on task {_terminal_safe(task['name'])} ({_terminal_safe(task['id'])})")
         if args.pr_text and shown:
             print()
             print(checks.pr_text(shown, _closing_url(task, repo)), end="")
@@ -1494,14 +1831,16 @@ def _fix(args: argparse.Namespace) -> int:
         with _client(cfg) as client:
             answer = client.take_fix(repo, args.number)
         if answer["action"] == "requested":
-            print(FIX_REQUESTED.format(owner=answer["request"]["owner"]))
+            print(FIX_REQUESTED.format(owner=_terminal_safe(answer["request"]["owner"])))
             return
         task = answer["task"]
         if answer["action"] == "created":
-            print(f"fix task: {task['name']} on {task['branch']} (#{args.number}, accepted)")
+            print(
+                f"fix task: {_terminal_safe(task['name'])} on {_terminal_safe(task['branch'])} (#{args.number}, accepted)"
+            )
         else:
-            print(f"#{args.number} is your task {task['name']}: continue it")
-        print(f"next: flowmode work {task['name']}")
+            print(f"#{args.number} is your task {_terminal_safe(task['name'])}: continue it")
+        print(f"next: flowmode work {_terminal_safe(task['name'])}")
 
     return _run(run, args)
 
@@ -1544,6 +1883,8 @@ def _client_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -
         return _env(args)
     if args.command == "install":
         return _install(args)
+    if args.command == "update":
+        return _update(args)
     if args.command == "doctor":
         from flowmode.doctor import doctor_cmd
 
@@ -1563,6 +1904,8 @@ def _client_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -
 
         return (pin_cmd if args.command == "pin" else pins_cmd)(args)
     if args.command == "check":
+        if args.mode == "commit-msg":
+            return _check_commit_msg(args.file)
         return _check(args)
     if args.command == "pr":
         return _pr(args)
@@ -1595,6 +1938,7 @@ def _client_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -
             "cancel": tasks.task_cancel,
             "delete": tasks.task_delete,
             "done": tasks.task_done,
+            "release": tasks.task_release,
         }[args.task_command](args)
     parser.print_usage(sys.stderr)
     return 2

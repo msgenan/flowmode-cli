@@ -21,9 +21,15 @@ from flowmode.github_cli import (
     issue_view,
 )
 from flowmode.ids import now_iso
-from flowmode.member_config import MemberConfig, load_member_config, old_token_hint, workspace_refusal
+from flowmode.member_config import (
+    MemberConfig,
+    load_member_config,
+    old_token_hint,
+    token_rejected,
+    workspace_refusal,
+)
 from flowmode.paths import symlink_on_the_way, write_no_follow
-from flowmode.refs import printable, valid_ref_name
+from flowmode.refs import display_safe, printable, terminal_safe, valid_ref_name
 from flowmode.repo import RepoInfo, canonical_repo, find_repo, origin_url, relative_path
 from flowmode.risky import DEFAULT_RISKY_PATTERNS, is_risky
 from flowmode.shared import TASK_NAME_RE, parse_issue_url
@@ -89,23 +95,39 @@ def _run(command, args) -> int:
     try:
         command(args)
     except Failed as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {terminal_safe(exc, 2000)}", file=sys.stderr)  # S20 F-20-90: may carry a server's text
         return 1
     except GitError as exc:
-        print(f"error: git: {exc}", file=sys.stderr)
+        print(f"error: git: {terminal_safe(exc, 2000)}", file=sys.stderr)
         return 1
     return 0
+
+
+SITE_REFUSALS = {  # S20 A4: refusals whose body names the task's page (`url`)
+    (403, "person_only"): "releasing or taking a task is done by a person on the site",
+    (409, "task_released"): "the task was released to the team; a person takes it on the site",
+}
 
 
 def api_failure(exc: Exception, cfg: MemberConfig) -> Failed:
     """The §7 wording for a failed API call."""
     if isinstance(exc, ServerUnreachable):
-        return Failed(f"could not reach {cfg.server_url} ({exc})")
+        return Failed(f"could not reach {cfg.server_url} ({terminal_safe(exc)})")
     if isinstance(exc, ApiError) and exc.status == 401:
-        return Failed(f"token rejected by {cfg.server_url}")
+        return Failed(token_rejected(cfg, exc.detail))
     if isinstance(exc, ApiError) and (refusal := workspace_refusal(exc.status, exc.detail)):  # S19: never names it
         return Failed(refusal)
-    return Failed(exc.detail if isinstance(exc, ApiError) else str(exc))
+    if isinstance(exc, ApiError) and (exc.status, exc.detail) in SITE_REFUSALS:  # S20 A4: release/take/resend
+        return Failed(f"{SITE_REFUSALS[exc.status, exc.detail]}: {_site_page(exc, cfg)}")
+    return Failed(terminal_safe(exc.detail if isinstance(exc, ApiError) else exc))  # S20 F-20-90: no escape reaches
+
+
+def _site_page(exc: ApiError, cfg: MemberConfig) -> str:
+    """The task page a site refusal names (`url`), printable; a server with no public_url names the path only."""
+    url = str(exc.body.get("url") or "")
+    if not url.startswith(("https://", "http://")):
+        url = cfg.server_url.rstrip("/") + url
+    return display_safe(url)
 
 
 @contextmanager
@@ -210,8 +232,8 @@ def _start(args) -> None:
     task, path = start_in_worktree(
         cfg, (root, main, repo), name, branch, path, assigned, branch_arg=args.branch, base=args.base
     )
-    print(f"task: {name}")
-    print(f"branch: {branch}")
+    print(f"task: {terminal_safe(name)}")
+    print(f"branch: {terminal_safe(branch)}")
     print(f"worktree: {path}")
     print(f"next: cd {path} && claude   (or codex) — hooks and MCP config were copied from {root}")
     if task["issue"]:  # catches up an accept made in the browser
@@ -361,7 +383,12 @@ def _list(args) -> None:
         tasks = client.list_tasks(repo=repo)
         handoffs = _handoffs_for(client.list_handoffs(status="pending", repo=repo), me)
     registry = load_registry()
-    tasks = [{**t, "worktree": _local_worktree(t, registry) or _server_worktree_here(t)} for t in tasks]
+    # F-20-95 (C1b, F14): a path the server knows is shown only for your own task; another person's is on their
+    # computer (it names their OS user), so theirs shows as branch only — unless a worktree of it is registered here
+    tasks = [
+        {**t, "worktree": _local_worktree(t, registry) or (_server_worktree_here(t) if t["owner"] == me else None)}
+        for t in tasks
+    ]
     if args.json:
         print(json.dumps({"repo": repo, "member": me, "tasks": tasks, "handoffs": handoffs}, indent=2))
         return
@@ -369,15 +396,19 @@ def _list(args) -> None:
     if not tasks:
         print("No tasks yet — flowmode task start <name>")
     for t in tasks:
-        where = f" · worktree {t['worktree']}" if t["worktree"] else ""
-        scope = f" · {t['repo']}" if repo is None else ""
-        print(f"- {t['name']} · branch {t['branch']} · owner {t['owner']} · {t['status']}{scope}{where}")
+        where = f" · worktree {terminal_safe(t['worktree'], 2000)}" if t["worktree"] else ""
+        scope = f" · {terminal_safe(t['repo'])}" if repo is None else ""
+        print(
+            f"- {terminal_safe(t['name'])} · branch {terminal_safe(t['branch'])} · owner {terminal_safe(t['owner'])} · {terminal_safe(t['status'])}{scope}{where}"
+        )
         if t["owner"] == me and t["status"] in OPEN_FOR_WORK:  # S11 F-11-38: the one line to go on
-            print(f"  next: {work_line(t['name'], t['worktree'])}")
+            print(f"  next: {terminal_safe(work_line(t['name'], t['worktree']), 2000)}")
     print(f"Handoffs for you ({len(handoffs)}):")
     for h in handoffs:
         summary = h["summary"].strip().splitlines()[0] if h["summary"].strip() else ""
-        print(f"- {h['id']} · from {h['from_member']} · task {h['task'] or '-'} · {summary}")
+        print(
+            f"- {terminal_safe(h['id'])} · from {terminal_safe(h['from_member'])} · task {terminal_safe(h['task'] or '-')} · {terminal_safe(summary)}"
+        )
 
 
 def task_list(args) -> int:
@@ -461,12 +492,12 @@ def _handoff(args) -> None:
         hints = _push_hints_for(client, session_id, handoff, root, args, to)
     target = handoff["task"] or handoff["id"]
     who = f"{to} can run" if to else "anyone can run"
-    print(f"handoff: {handoff['id']}")
+    print(f"handoff: {terminal_safe(handoff['id'])}")
     print(f"to: {to or 'unassigned'}")
-    print(f"paths: {', '.join(handoff['paths']) or '(none)'}")
+    print(f"paths: {terminal_safe(', '.join(handoff['paths']), 2000) or '(none)'}")  # S20 F-20-90
     for key, text in hints:
         print(f"{key}: {text}")
-    print(f"next: {who}  flowmode task take {target}")
+    print(f"next: {who}  flowmode task take {terminal_safe(target)}  (takes this handoff into a worktree)")
 
 
 def handoff_cmd(args) -> int:
@@ -511,12 +542,43 @@ def _is_worktree_on(main: Path, path: Path, branch: str) -> bool:
     return any(w["branch"] == branch and w["path"].resolve() == path.resolve() for w in list_worktrees(main))
 
 
+def _take_released(client: ApiClient, cfg: MemberConfig, task: dict) -> None:
+    """S20 L-7: take a task released to the team — the server step only (no worktree: `flowmode work` makes it). A4:
+    the server takes it only from a web session, so with a device token this prints the task's page and that this
+    command takes handoffs (F-20-95, C1b F7: the two meanings of `task take` told apart); no success line."""
+    if task.get("released_at") is None:
+        raise Failed(f"task {task['name']} is not released (its owner or a leader releases it first)")
+    try:
+        client.take_task(task["id"])
+    except ApiError as exc:
+        if (exc.status, exc.detail) != (403, "person_only"):
+            raise
+        raise Failed(
+            f"this task was released — take it on the site: {_site_page(exc, cfg)}; `flowmode task take` takes a"
+            " handoff"
+        ) from exc
+
+
 def _take(args) -> None:
+    """A handoff (`hof_…`, or a task name with a handoff for you) into a new worktree; S20: a released task
+    (`tsk_…`, or a task name with no handoff for you but a released task of that name) becomes yours."""
     cfg = _config()
+    if args.target.startswith("tsk_"):
+        with _client(cfg) as client:
+            return _take_released(client, cfg, _resolve_task(client, args.target, args.repo))
     root, main, repo = _checkout(args.repo)
     with _client(cfg) as client:
         me = client.me()["name"]
-        handoff = _resolve_handoff(client, args.target, repo, me)
+        try:
+            handoff = _resolve_handoff(client, args.target, repo, me)
+        except Failed:
+            released = None
+            if not args.target.startswith("hof_"):
+                found = client.list_tasks(repo=repo, name=args.target)
+                released = next((t for t in found if t.get("released_at") is not None), None)
+            if released is None:
+                raise  # the handoff's own error (no pending handoff for task …) stays the answer
+            return _take_released(client, cfg, released)
     path = (
         Path(args.path).expanduser().absolute()
         if args.path
@@ -524,14 +586,14 @@ def _take(args) -> None:
     )
     handoff, _, path = take_into_worktree(cfg, (root, main, repo), handoff, path)
     summary = handoff["summary"].strip().splitlines()
-    print(f"handoff: {handoff['id']}")
-    print(f"from: {handoff['from_member']}")
-    print(f"task: {handoff['task'] or '-'}")
-    print(f"branch: {handoff['branch']}")
-    print(f"worktree: {path}")
-    print(f"summary: {summary[0] if summary else ''}")
-    print(f"files: {', '.join(handoff['paths']) or '(none)'}")
-    print(f"next: cd {path} && claude   (or codex)")
+    print(f"handoff: {terminal_safe(handoff['id'])}")
+    print(f"from: {terminal_safe(handoff['from_member'])}")
+    print(f"task: {terminal_safe(handoff['task'] or '-')}")
+    print(f"branch: {terminal_safe(handoff['branch'])}")
+    print(f"worktree: {terminal_safe(str(path), 2000)}")
+    print(f"summary: {terminal_safe(summary[0]) if summary else ''}")
+    print(f"files: {terminal_safe(', '.join(handoff['paths']), 2000) or '(none)'}")
+    print(f"next: cd {terminal_safe(str(path), 2000)} && claude   (or codex)")
 
 
 def check_handoff_branch(branch: str) -> None:
@@ -561,7 +623,7 @@ def take_into_worktree(
             if busy is not None:
                 raise Failed(
                     f"branch '{branch}' is checked out in {Path(busy).resolve()} — take it there, or ask "
-                    f"{handoff['from_member']} to hand off a task branch"
+                    f"{terminal_safe(handoff['from_member'])} to hand off a task branch"
                 )
         elif remote_branch_exists(main, branch):
             track, created_branch = True, branch
@@ -644,7 +706,7 @@ def _gh_after_server(task: dict, checkout: tuple[Path, str | None], step, failur
     """§4: a gh step after the server answered (the server step stands). Runs only on the issue of the checkout's own
     GitHub repo; any gh problem is a warning. True when gh did it."""
     issue, (root, github) = task["issue"], checkout
-    ref = f"{issue['repo']}#{issue['number']}"
+    ref = terminal_safe(f"{issue['repo']}#{issue['number']}")  # S20 F-20-90: the server's issue repo
     if not _same_github_repo(github, issue["repo"]):
         print(
             f"warning: not touching {ref} on GitHub: this checkout's GitHub remote is {github or 'none'}",
@@ -655,7 +717,7 @@ def _gh_after_server(task: dict, checkout: tuple[Path, str | None], step, failur
         step(issue, root)
     except (GhMissing, GhError) as exc:
         why = "gh not found" if isinstance(exc, GhMissing) else str(exc)
-        print(f"warning: {failure.format(ref=ref, why=why, **issue)}", file=sys.stderr)
+        print(f"warning: {terminal_safe(failure.format(ref=ref, why=why, **issue), 2000)}", file=sys.stderr)
         return False
     return True
 
@@ -682,11 +744,11 @@ def _issue_for_new(number: int, root: Path, github: str | None) -> dict:
 
 
 def _print_task(task: dict, *extra: tuple[str, str]) -> None:
-    print(f"task: {task['name']}")
-    print(f"id: {task['id']}")
-    print(f"status: {task['status']}")
+    print(f"task: {terminal_safe(task['name'])}")
+    print(f"id: {terminal_safe(task['id'])}")
+    print(f"status: {terminal_safe(task['status'])}")
     for key, value in extra:
-        print(f"{key}: {value}")
+        print(f"{key}: {terminal_safe(value, 2000)}")  # S20 F-20-90: the server's names
 
 
 def _new(args) -> None:
@@ -721,16 +783,16 @@ def _new(args) -> None:
             issue_url=issue["url"] if issue else None,
             issue_body=issue.get("body") if issue else None,
         )  # S11 F-11-28
-    print(f"task: {task['name']}")
-    print(f"id: {task['id']}")
-    print(f"to: {task['owner']}")
-    print(f"status: {task['status']}")
-    print(f"issue: {_issue_ref(task)}")
+    print(f"task: {terminal_safe(task['name'])}")
+    print(f"id: {terminal_safe(task['id'])}")
+    print(f"to: {terminal_safe(task['owner'])}")
+    print(f"status: {terminal_safe(task['status'])}")
+    print(f"issue: {terminal_safe(_issue_ref(task))}")
     if task["status"] == "accepted":
-        print(f"next: flowmode work {task['name']}")  # S11 F-11-38
-        print(only_worktree(task["name"]))
+        print(f"next: flowmode work {terminal_safe(task['name'])}")  # S11 F-11-38
+        print(only_worktree(terminal_safe(task["name"])))
     else:
-        print(f"next: {task['owner']} sees it in  flowmode task inbox  and accepts or declines it")
+        print(f"next: {terminal_safe(task['owner'])} sees it in  flowmode task inbox  and accepts or declines it")
     if task["status"] == "accepted" and task["issue"]:
         _gh_after_server(
             task, checkout, assign_to_me, "could not assign {ref} to you on GitHub ({why}); the task is accepted"
@@ -754,14 +816,18 @@ def _inbox(args) -> None:
     if not inbox:
         print("Nothing waiting for you.")
     for t in inbox:
-        issue = f" · issue {_issue_ref(t)}" if t["issue"] else ""
-        print(f"- {t['id']} · {t['name']} · from {_assigner(t)} · {t['repo']} · {t['title']}{issue}")
-        print(f"  next: flowmode work {t['name']}")  # S11 F-11-38: accepts, opens the worktree, starts the agent
+        issue = f" · issue {terminal_safe(_issue_ref(t))}" if t["issue"] else ""
+        print(
+            f"- {terminal_safe(t['id'])} · {terminal_safe(t['name'])} · from {terminal_safe(_assigner(t))} · {terminal_safe(t['repo'])} · {terminal_safe(t['title'])}{issue}"
+        )
+        print(
+            f"  next: flowmode work {terminal_safe(t['name'])}"
+        )  # S11 F-11-38: accepts, opens the worktree, starts the agent
     print(f"Declined ({len(declined)}):")
     for t in declined:
         print(
-            f"- {t['id']} · {t['name']} · declined by {t['owner']} · {t['repo']} · "
-            f"reason: {_one_line(t['decline_reason'])}"
+            f"- {terminal_safe(t['id'])} · {terminal_safe(t['name'])} · declined by {terminal_safe(t['owner'])} · {terminal_safe(t['repo'])} · "
+            f"reason: {terminal_safe(_one_line(t['decline_reason']))}"
         )
 
 
@@ -794,7 +860,7 @@ def _act(args, action) -> dict:
 def _accept(args) -> None:
     task = _act(args, lambda client, task_id: client.accept_task(task_id))
     _print_task(task, ("from", _assigner(task)), ("next", f"flowmode work {task['name']}"))
-    print(only_worktree(task["name"]))
+    print(only_worktree(terminal_safe(task["name"])))
     if task["issue"]:
         _gh_after_server(
             task,
@@ -814,6 +880,12 @@ def _resend(args) -> None:
     _print_task(task, ("to", task["owner"]))
 
 
+def _release(args) -> None:
+    """S20 L-7: the owner or a leader gives the task back to the team; any member takes it. A4: the server takes both
+    only from a web session, so with a device token this prints the task's page (`api_failure`) and exits 1."""
+    _act(args, lambda client, task_id: client.release_task(task_id, args.note))
+
+
 def _cancel(args) -> None:
     _print_task(_act(args, lambda client, task_id: client.cancel_task(task_id)))
 
@@ -825,7 +897,7 @@ def _delete(args) -> None:
         task = _resolve_task(client, args.target, args.repo)
         if not args.yes:
             prompt = (
-                f"Delete task '{task['name']}' (owner {task['owner']})? It disappears for everyone; events keep"
+                f"Delete task '{terminal_safe(task['name'])}' (owner {terminal_safe(task['owner'])})? It disappears for everyone; events keep"
                 " the history. [y/N] "
             )
             try:
@@ -837,7 +909,7 @@ def _delete(args) -> None:
             if answer.strip().lower() != "y":
                 raise Failed("not deleted")
         client.delete_task(task["id"])
-    print(f"deleted: {task['name']}")
+    print(f"deleted: {terminal_safe(task['name'])}")
 
 
 def _done(args) -> None:
@@ -853,7 +925,7 @@ def _done(args) -> None:
         )
     if not task["issue"]:
         return
-    ref = _issue_ref(task)
+    ref = terminal_safe(_issue_ref(task))  # S20 F-20-90: the server's issue repo
     github = _gh_checkout(args.repo)[1]
     if _same_github_repo(github, task["issue"]["repo"]):
         print(f"issue: {ref} stays open (closes when its pull request is merged)")
@@ -876,6 +948,10 @@ def task_decline(args) -> int:
 
 def task_resend(args) -> int:
     return _run(_resend, args)
+
+
+def task_release(args) -> int:
+    return _run(_release, args)
 
 
 def task_cancel(args) -> int:
@@ -918,7 +994,8 @@ def _pin(args) -> None:
         commit = None  # a repository without a commit yet: the note is pinned without one
     with _client(cfg) as client:
         pin = client.create_pin(info.repo, path, args.text, commit)
-    print(f"pinned {pin['path']} at {pin['commit']}" if pin.get("commit") else f"pinned {pin['path']}")
+    where = f" at {terminal_safe(pin['commit'])}" if pin.get("commit") else ""
+    print(f"pinned {terminal_safe(pin['path'])}{where}")  # S20 F-20-90: the server's echo through the one filter
 
 
 def pin_cmd(args) -> int:
@@ -933,7 +1010,7 @@ def _pins(args) -> None:
     for pin in pins:
         lines = pin["text"].strip().splitlines()
         state = "stale" if pin["stale"] else "ok"
-        print(f"{pin['path']} · {state} · {pin['member']} · {lines[0] if lines else ''}")
+        print(f"{terminal_safe(pin['path'])} · {state} · {pin['member']} · {terminal_safe(lines[0]) if lines else ''}")
 
 
 def pins_cmd(args) -> int:

@@ -26,7 +26,7 @@ from pathlib import Path
 
 import flowmode
 from flowmode import shared
-from flowmode.agents.claude import HOOK_PREFIX
+from flowmode.agents.claude import ATTRIBUTION_OFF, HOOK_PREFIX
 from flowmode.agents.codex import codex_home
 from flowmode.github_cli import gh_ready
 from flowmode.member_config import (
@@ -35,6 +35,7 @@ from flowmode.member_config import (
     old_token_hint,
     read_config_file,
     set_workspace_repo,
+    token_rejected,
     workspace_entries,
     workspace_refusal,
 )
@@ -63,23 +64,29 @@ def _json(path: Path) -> dict:
 
 
 def _has_flowmode_hook(path: Path) -> bool:
-    """A hooks file (Claude's settings or Codex's hooks.json) with at least one `flowmode hook …` command."""
+    """A hooks file (Claude's settings or Codex's hooks.json) whose PreToolUse runs a `flowmode hook …` command — the
+    entry that carries approvals and the local refusals (F-20-88: another flowmode entry alone is not enough)."""
     hooks = _json(path).get("hooks")
-    groups = (
-        [g for event in hooks.values() if isinstance(event, list) for g in event] if isinstance(hooks, dict) else []
-    )
+    groups = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
     return any(
         isinstance(hook, dict) and str(hook.get("command", "")).startswith(HOOK_PREFIX)
-        for group in groups
+        for group in (groups if isinstance(groups, list) else [])
         if isinstance(group, dict) and isinstance(group.get("hooks"), list)
         for hook in group["hooks"]
     )
 
 
 def _claude_hooks(root: Path) -> bool:
+    """Flowmode's Claude hooks and MCP server are in the clone, and neither project settings file switches every hook
+    off (`disableAllHooks`, F-20-88)."""
     servers = _json(root / ".mcp.json").get("mcpServers")
-    return _has_flowmode_hook(root / ".claude" / "settings.json") and isinstance(
-        servers.get("flowmode") if isinstance(servers, dict) else None, dict
+    switched_off = any(
+        _json(root / ".claude" / name).get("disableAllHooks") for name in ("settings.json", "settings.local.json")
+    )
+    return (
+        not switched_off
+        and _has_flowmode_hook(root / ".claude" / "settings.json")
+        and isinstance(servers.get("flowmode") if isinstance(servers, dict) else None, dict)
     )
 
 
@@ -164,7 +171,7 @@ def _why(exc: Exception, cfg: MemberConfig) -> str:
         return f"could not reach {cfg.server_url} ({exc})"
     if isinstance(exc, ApiError):
         if exc.status == 401:
-            return f"token rejected by {cfg.server_url}"
+            return token_rejected(cfg, exc.detail)
         if refusal := workspace_refusal(exc.status, exc.detail):  # S19: never names the other workspace
             return refusal
         detail = exc.detail if exc.status != 422 else "the server refused the report's fields"
@@ -312,6 +319,10 @@ def _lines(facts: dict, fixes: list[dict], team: str | None, sent: bool, answer:
         lines.append(f"{'✓' if ok else '✗'} {text}")
         for fix in (f for f in fixes if f["fact"] == key):
             lines.append(f"    fix: {fix['command']}  ({fix['text']})" if "command" in fix else f"    {fix['text']}")
+        if key == "hooks_tracked" and not ok and not any(f["fact"] == key for f in fixes):  # F-20-100: like every ✗
+            files = " ".join(p for agent in shared.AGENTS if facts["hooks"][agent] for p in shared.HOOK_FILES[agent])
+            if files:
+                lines.append(f'    fix: git add {files} && git commit -m "Add Flowmode hooks"')
         if key == "cli" and (older := _older_line(facts, answer)):
             lines.append(older)
     return lines
@@ -355,6 +366,36 @@ def _workspace_lines(cfg: MemberConfig | None, state: str | None, why: str | Non
     return lines
 
 
+def _attribution_lines(root) -> list[str]:
+    """S20 §4.3: local facts only — never sent with the report, never a fix: Claude's attribution settings (when the
+    repo has Claude settings) and the git commit-msg check."""
+    from flowmode.install import commit_msg_check_off, commit_msg_fix, commit_msg_hook_state
+
+    lines = []
+    settings_path = Path(root) / ".claude" / "settings.json"
+    if settings_path.is_file():
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            settings = None
+        off = isinstance(settings, dict) and all(settings.get(k) == v for k, v in ATTRIBUTION_OFF.items())
+        lines.append(
+            "✓ agent attribution off (Claude settings)"
+            if off
+            else "✗ agent attribution not off (Claude settings) — run  flowmode install claude"
+        )
+    installed, why = commit_msg_hook_state(Path(root))
+    if not installed and why and why.startswith("core.hooksPath") and commit_msg_check_off(Path(root)) is None:
+        lines.append("✓ commit-msg check installed (in the core.hooksPath folder)")
+    elif not installed:
+        lines.append(f"✗ commit-msg check not installed: {why}")
+    elif off := commit_msg_check_off(Path(root)):  # S20 F-20-81: installed once, switched off since
+        lines.append(f"✗ commit-msg check off: {off} — {commit_msg_fix(off, 'claude (or codex)')}")
+    else:
+        lines.append("✓ commit-msg check installed")
+    return lines
+
+
 def doctor_cmd(args) -> int:
     cfg = load_member_config()
     info = find_repo(Path.cwd())
@@ -375,6 +416,7 @@ def doctor_cmd(args) -> int:
             print(json.dumps(answer, indent=2))
     else:
         print("\n".join(_lines(facts, fixes, team, sent, answer)))
+        print("\n".join(_attribution_lines(info.root)))
         if changed:
             print(_team_line(team))
         if sent:

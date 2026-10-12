@@ -6,7 +6,7 @@ The Flowmode command-line client connects this computer's coding agents (Claude 
 
 ## Requirements
 
-macOS or Linux, or Windows through WSL. You need `git` and `curl`.
+macOS or Linux, or Windows through WSL. You need `git`, `curl` and the GitHub CLI (`gh`, signed in with `gh auth login`; card 3, "Check your repo", needs it).
 
 ## Set up
 
@@ -28,7 +28,7 @@ This signs in with GitHub using device flow (`flowmode login --server <server>`)
 
 ## What setup.sh installs
 
-If uv is missing, `setup.sh` installs uv 0.12.10 from Astral's versioned installer at `https://astral.sh/uv/0.12.10/install.sh`. It installs Python through uv if missing, then installs the `flowmode` command with the clone's pinned dependency versions.
+If uv is missing, `setup.sh` installs uv 0.12.10 from Astral's versioned installer at `https://astral.sh/uv/0.12.10/install.sh`. It installs Python through uv if missing, then installs the `flowmode` command with the clone's pinned dependency versions (`uv.lock`), built with the pinned build backend (`hatchling==1.32.4` and its own dependencies, exact, in `pyproject.toml`). `flowmode update` keeps the release it installs from in `~/.flowmode/client-src/v<version>` (private to you), so `uv tool upgrade` rebuilds from your own copy.
 
 It changes no shell rc file. If the tool folder is not on PATH, it prints one line saying how to add it.
 

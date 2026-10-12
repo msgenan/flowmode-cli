@@ -22,6 +22,14 @@ def flowmode_home() -> Path:
 DEVICE_TOKEN_PREFIX = "fmd_"  # noqa: S105 — a prefix, not a token
 DEVICE_PAGE = "https://github.com/login/device"  # the only page a person is ever told to type a code into (R-7)
 
+# --- a taken task (S20 C1e): the note the server leaves on the old owner's live sessions, and how the hook knows it ---
+# Only the validated task name (TASK_NAME_RE) and the taker's handle: a title is written by someone else (the assigner,
+# a GitHub issue, a PR) and never reaches an agent unframed (S7 §9).
+TAKEN_NOTE = "Flowmode: task {name} was taken by @{to}; stop working on it and hand over."
+TAKEN_NOTE_RE = re.compile(
+    r"^Flowmode: task [a-z0-9][a-z0-9._-]{0,63} was taken by @[^\s;]{1,64}; stop working on it and hand over\.$"
+)
+
 # --- task names and issue links (S7 §2.2) ------------------------------------------------------------------------------
 TASK_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 ISSUE_URL_RE = re.compile(
@@ -194,7 +202,14 @@ def repo_fixes(facts: dict, team_repo: str | None, leader: bool, *, team_known: 
     gh = facts.get("gh") or {}
     if not (gh.get("installed") and gh.get("signed_in")):
         text = "Sign in to GitHub with gh" if gh.get("installed") else "Install the GitHub CLI, then sign in with it"
-        fixes.append(_fix("gh", text, "gh auth login"))
+        if gh.get("installed"):
+            command = "gh auth login"
+        elif str(facts.get("os") or "").startswith("Darwin"):
+            command = "brew install gh && gh auth login"
+        else:  # Linux and WSL: the packages differ per distribution, so the advice is prose, not a copyable command
+            command = None
+            text = "Install the GitHub CLI (gh) with your package manager, then sign in with: gh auth login"
+        fixes.append(_fix("gh", text, command))
     if leader and ready and not facts.get("hooks_tracked"):
         files = " ".join(path for agent in ready for path in HOOK_FILES[agent])
         command = f'git add {files} && git commit -m "Add flowmode hooks" && git push'

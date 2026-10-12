@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from flowmode.github_cli import assign_to_me, github_repo_of
+from flowmode.refs import terminal_safe
 from flowmode.task_registry import find_worktree, forget_worktree, load_registry
 from flowmode.tasks import (
     OPEN_FOR_WORK,
@@ -107,7 +108,7 @@ def _ask(question: str) -> str:
 def _pick(choices: list[Choice], me: str) -> Choice:
     print(f"Your tasks ({len(choices)}):")
     for i, choice in enumerate(choices, 1):
-        print(f"  {i}  {choice.describe(me)}")
+        print(f"  {i}  {terminal_safe(choice.describe(me), 2000)}")  # S20 F-20-90: titles, summaries
     for _ in range(TRIES):
         answer = _ask("Which task? [1]") or "1"
         if answer.isdigit() and 1 <= int(answer) <= len(choices):
@@ -128,6 +129,18 @@ def _agent() -> str:
             return AGENTS[int(answer) - 1]
         print("answer claude or codex")
     raise Failed("no agent chosen (or pass --agent claude|codex)")
+
+
+def _choose_agent(args) -> str:
+    """`--agent`, else the question; `--no-launch` starts nothing, so with no one to answer it is claude (walkthrough F25)."""
+    if args.agent:
+        return args.agent
+    try:
+        return _agent()
+    except Failed:
+        if args.no_launch:
+            return "claude"
+        raise
 
 
 def _existing_worktree(main: Path, task_id: str | None, repo: str, branch: str, gone=None) -> Path | None:
@@ -251,21 +264,21 @@ def _work(args) -> None:
             raise Failed(f"'{args.task}' is not one of your tasks in {repo} — run  flowmode work  to see them")
     else:
         choice = _pick(choices, me)
-    agent = args.agent or _agent()
+    agent = _choose_agent(args)
 
     if choice.kind == "task":
         task, path = _open_task(cfg, checkout, choice.item)
         name, branch = task["name"], task["branch"]
     else:
         handoff, path = _open_handoff(cfg, checkout, choice.item, me)
-        print(f"handoff: {handoff['id']}")
-        print(f"from: {handoff['from_member']}")
+        print(f"handoff: {terminal_safe(handoff['id'])}")  # S20 F-20-90: server text through the one filter
+        print(f"from: {terminal_safe(handoff['from_member'])}")
         name, branch = handoff["task"] or "-", handoff["branch"]
     launch = f"cd {shlex.quote(str(path))} && {agent}"
-    print(f"task: {name}")
-    print(f"branch: {branch}")
-    print(f"worktree: {path}")
-    print(f"launch: {launch}")
+    print(f"task: {terminal_safe(name)}")
+    print(f"branch: {terminal_safe(branch)}")
+    print(f"worktree: {terminal_safe(str(path), 2000)}")
+    print(f"launch: {terminal_safe(launch, 2000)}")
     if args.no_launch:
         return
     sys.stdout.flush()  # exec replaces the process: what is still buffered would be lost

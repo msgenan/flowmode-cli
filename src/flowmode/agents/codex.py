@@ -131,13 +131,18 @@ class CodexAdapter(ClaudeAdapter):
         req = super().parse(event, stdin_text)  # common fields, agent=self.name
         tool_input = json.loads(stdin_text).get("tool_input")
         tool_input = tool_input if isinstance(tool_input, dict) else {}
-        req.file_paths, req.command = [], None
+        req.file_paths, req.command, req.new_text, req.file_input = [], None, "", {}
         if req.tool_name in FILE_TOOLS and isinstance(tool_input.get("file_path"), str):
             req.file_paths = [tool_input["file_path"]]
+            req.new_text = claude.new_file_text(tool_input)
         elif req.tool_name in PATCH_TOOLS:
             req.file_paths = patch_paths(tool_input)
+            # the lines the patch adds (S20 F-20-81 reads them for hooksPath)
+            req.new_text = "\n".join(ln for t in _strings(tool_input) for ln in t.splitlines() if ln.startswith("+"))
         elif req.tool_name in COMMAND_TOOLS:
             req.command = _command(tool_input)
+        if req.file_paths:
+            req.file_input = tool_input  # F-20-88: the agent hooks' new text
         return req
 
     def install(self, repo: Path, cfg: MemberConfig) -> tuple[list[Path], list[str]]:
@@ -157,5 +162,8 @@ class CodexAdapter(ClaudeAdapter):
         config_path.write_text(config)
         return [hooks_path, config_path], [
             "next: Codex asks once to trust this repo's hooks (.codex/hooks.json) — approve it when prompted",
-            'next: export FLOWMODE_TOKEN in the shell that starts codex, e.g.  eval "$(flowmode env)"',
+            (
+                "next: start with  flowmode work ; only if you start codex yourself, export FLOWMODE_TOKEN in that"
+                ' shell first, e.g.  eval "$(flowmode env)"'
+            ),
         ]

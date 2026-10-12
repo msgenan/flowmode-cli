@@ -31,7 +31,7 @@ from pathlib import Path
 
 from flowmode import github_cli
 from flowmode.paths import secret_looking, valid_repo_path
-from flowmode.refs import display_safe, valid_ref_name
+from flowmode.refs import display_safe, terminal_safe, valid_ref_name
 from flowmode.repo import RepoInfo, find_repo, is_checkout
 from flowmode.repo_config import load_repo_config
 from flowmode.shared import closing_refs, flowmode_home
@@ -41,7 +41,6 @@ STATE_FILE = "sync.json"
 PULLS_EVERY = timedelta(hours=24)  # the automatic pull sync runs at most once a day per member and repo
 PULLS_RETRY = timedelta(hours=6)  # after gh was missing, not signed in or failing, the automatic child waits this long
 LOCK_STALE_SECONDS = 600  # a lock older than this is left over from a child that died: it is replaced
-DEFAULT_DAYS = 30
 MAX_DAYS = 30
 MAX_TITLE = 200
 MAX_LABELS = 10
@@ -214,7 +213,7 @@ def spawn(root: Path | str) -> int | None:
     `$FLOWMODE_HOME`, never in argv."""
     try:
         child = subprocess.Popen(
-            [sys.executable, "-m", "flowmode", "pr", "sync", "--auto", "--repo", str(root)],
+            [sys.executable, "-P", "-m", "flowmode", "pr", "sync", "--auto", "--repo", str(root)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -436,11 +435,11 @@ def _send_pulls(args: argparse.Namespace, cfg, root: Path, repo: str, owner_name
     if answer.get("skipped") == "recent":
         say("pulls: skipped — sent within the last 24 hours")
         return failed
-    say(pulls_line(answer, len(pulls), args.days, truncated))
+    say(terminal_safe(pulls_line(answer, len(pulls), args.days, truncated), 2000))  # S20 F-20-90: the server's counts
     if complete:
         say(f"issues: {len(issues)} open")
     for held in answer.get("held") or []:
-        say(held_line(held))
+        say(terminal_safe(held_line(held), 2000))
     return failed
 
 
@@ -593,7 +592,7 @@ def _tree_part(cfg, root: Path, info: RepoInfo, repo: str, say) -> bool:
             if exc.status != 409:
                 raise
             mark(repo, tree_sha=sha)
-            say(f"tree: not sent — the server has a newer commit ({str(exc.body.get('kept'))[:7]})")
+            say(f"tree: not sent — the server has a newer commit ({terminal_safe(str(exc.body.get('kept'))[:7])})")
             return False
     if answer.get("ignored") == "repo":
         say(f"tree: not sent — the server does not know {repo} yet")
